@@ -1,0 +1,3 @@
+output_dir: test_output
+run_id: test_run
+seed: 42

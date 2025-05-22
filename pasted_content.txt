@@ -1,0 +1,34 @@
+thank you for these thoughtful questions. They will help ensure 'NES Co-Pilot' is built effectively. Here are my clarifications:
+Existing Code:
+Yes, absolutely. We have significant existing Python code that should be incorporated and form the foundation of several modules:
+agent_mvnes.py: This contains the core MVNESAgent class with its run_mvnes_trial method. The latest version implements alpha_gain, valence-driven start-point bias (beta_val, logit_z0), norm-type temporal decay (log_tau_norm), and placeholders for meta-cognitive monitoring. This should be the core of the Simulation Module.
+stats_schema.py: This new file defines the canonical list of 60 summary statistics (ROBERTS_SUMMARY_STAT_KEYS) and validation logic. This should be used by the Summary Statistics Module.
+fit_nes_to_roberts_data_sbc_focused.py (latest version for 6/7/8-param model): This script contains working logic for:
+Loading Roberts data and preparing the SUBJECT_TRIAL_STRUCTURE_TEMPLATE (can inform the Data Preparation Module).
+The nes_sbi_simulator function (which wraps MVNESAgent and calls summary stat calculation) – this is key for the NPE Training Module and SBC Module.
+The main loops for NPE training (manual simulation loop) and SBC (manual simulation loop, rank calculation, KS tests, manual plotting). This logic should be adapted for the NPE Training Module and SBC Module.
+run_ppc_nes_roberts.py (latest version): This script contains working logic for:
+Loading a trained NPE and empirical fit results.
+Iterating through subjects to generate PPCs.
+Calculating summary stats for empirical and simulated PPC data.
+Generating PPC coverage tables and some visual PPC plots. This should inform the PPC Module.
+Sentiment Analysis Snippet (from advisor's plan): We have a conceptual plan for get_trial_valence_scores using cardiffnlp/twitter-roberta-base-sentiment. This will need to be implemented for the Data Preparation Module (Stimulus Valence Processor).
+Goal: Leverage and refactor this existing, tested code into the new modular structure rather than reinventing it.
+Technology Stack Preferences:
+Workflow Management: For Phase 1 and 2, let's start with a simpler Python-based orchestration. This could mean a master Python script that calls module-specific scripts/functions based on the configuration, perhaps with basic file-based dependency checking. We can consider more complex tools like Snakemake or Prefect later if the pipeline becomes very intricate or if HPC deployment becomes a primary need. Simplicity and ease of debugging are key initially.
+Data Versioning (DVC): This is a good idea for the long term (Phase 2 or 3). For Phase 1, let's focus on a clear output directory structure with timestamping/run IDs and comprehensive metadata files (JSONs logging all configurations, seeds, software versions, and paths to inputs/outputs for each run). This will provide basic versioning and reproducibility.
+Implementation Priority:
+Please focus on implementing Phase 1 (Core Modules & Configuration) completely first. We need a robust, reliable, and configuration-driven pipeline for the current set of core tasks (Data Prep, NPE Train, SBC, Empirical Fit, PPC, Analysis) before we add more advanced automation or agentic capabilities. A solid foundation is paramount.
+Computational Environment:
+The system will primarily run on local machines (high-performance desktops/workstations, likely Windows/Linux) for now.
+Parallelism should initially be implemented using Python's multiprocessing or libraries like joblib where appropriate (e.g., parallelizing simulations within NPE training or SBC dataset generation if the simulator is stateless per call). pebble has been useful for timeout handling in the PPC script; similar robust timeout mechanisms are good.
+Design for potential future HPC adaptation, but local execution is the immediate target.
+Existing Data Format:
+Empirical Data (Roberts et al. CSV): Standard CSV format. Key columns include subject, block, trial, cond ('ntc', 'tc'), timelimit, frame ('gain', 'loss'), endow, prob, sureOutcome, choice (0=sure, 1=gamble), rt, trialType ('target', 'catch', etc.). We filter for trialType == 'target'.
+Trial Structure Templates: Currently generated on-the-fly by sampling from the empirical data (as seen in fit_nes_to_roberts_data_sbc_focused.py). This template includes columns like frame, cond, prob, is_gain_frame, time_constrained, and will need to include valence_score and norm_category_for_trial. It's saved/used as a pandas DataFrame internally.
+Dependencies:
+sbi: We've had success with sbi v0.22.0 after difficulties with other versions. Let's standardize on this version for now to ensure consistent behavior of SBC functions like run_sbc and sbc_rank_plot. If a compelling reason arises to upgrade, we can address it, but stability with v0.22.0 is preferred given past issues.
+torch: A recent version compatible with sbi v0.22.0 and your hardware (CPU primarily, but GPU capability is a plus if a CUDA-enabled torch is easy to manage). torch 1.13.x up to torch 2.x (e.g., what sbi v0.22.0 itself might pull in as a dependency) should be fine.
+Python: Python 3.9 has been used for the environment recreation. Let's stick with this.
+Other standard libraries: numpy, pandas, scipy, matplotlib, seaborn, tqdm, transformers (for RoBERTa). Specific versions aren't critical unless known conflicts arise with sbi v0.22.0 or torch.
+These clarifications should provide a solid basis for you to begin designing 'NES Co-Pilot', starting with leveraging our existing, hard-won code. The focus is on creating a robust, configurable, and modular Phase 1.
