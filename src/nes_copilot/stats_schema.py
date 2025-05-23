@@ -72,7 +72,7 @@ STATS_METADATA = {
     }
 }
 
-def validate_summary_stats(stats: Dict[str, float]) -> bool:
+def validate_summary_stats(stats: Dict[str, float]) -> tuple[bool, str]:
     """
     Validate that the summary statistics dictionary contains all expected statistics
     and that their values are within expected ranges.
@@ -81,22 +81,23 @@ def validate_summary_stats(stats: Dict[str, float]) -> bool:
         stats: Dictionary of summary statistics.
         
     Returns:
-        bool: True if the statistics are valid, False otherwise.
+        tuple: (is_valid, message) where is_valid is a boolean indicating if the
+              statistics are valid, and message provides details about any validation issues.
     """
     # Check if all expected statistics are present
-    for key in NES_SUMMARY_STAT_KEYS:
-        if key not in stats:
-            return False
-            
+    missing_stats = [key for key in NES_SUMMARY_STAT_KEYS if key not in stats]
+    if missing_stats:
+        return False, f"Missing required statistics: {', '.join(missing_stats)}"
+    
     # Check if there are any unexpected statistics
-    for key in stats:
-        if key not in NES_SUMMARY_STAT_KEYS:
-            return False
-            
-    # Check value ranges
+    extra_stats = [key for key in stats if key not in NES_SUMMARY_STAT_KEYS]
+    if extra_stats:
+        return False, f"Unexpected statistics found: {', '.join(extra_stats)}"
+    
+    # Check value ranges and validity
     for key, value in stats.items():
         if not np.isfinite(value):
-            return False
+            return False, f"Non-finite value for {key}: {value}"
             
         # Get metadata for this statistic
         meta = STATS_METADATA.get(key, {})
@@ -105,10 +106,14 @@ def validate_summary_stats(stats: Dict[str, float]) -> bool:
             
         # Check if value is within expected range
         val_range = meta.get('range')
-        if val_range and not (val_range[0] <= value <= val_range[1]):
-            return False
-            
-    return True
+        if val_range:
+            min_val, max_val = val_range
+            if min_val is not None and value < min_val:
+                return False, f"Value for {key} ({value}) is below minimum allowed ({min_val})"
+            if max_val is not None and value > max_val:
+                return False, f"Value for {key} ({value}) is above maximum allowed ({max_val})"
+    
+    return True, "All statistics are valid"
 
 def get_stat_description(stat_name: str) -> str:
     """Get a human-readable description of a statistic."""
