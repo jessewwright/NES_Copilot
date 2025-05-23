@@ -33,6 +33,7 @@ ENV/
 
 # Logs
 *.log
+sbi-logs/
 
 # Local development
 .env
@@ -49,6 +50,30 @@ ENV/
 *.pb
 *.tflite
 *.tfl
+
+# Data and results
+data/processed/
+data/raw/
+Roberts_Framing_Data/
+results/
+sbc_nes_6param_60SS_tightPrior_nsf_60k_TEST/
+
+# Large files
+*.zip
+*.npz
+*.npy
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 *.lite
 *.quant
 *.mlmodel
