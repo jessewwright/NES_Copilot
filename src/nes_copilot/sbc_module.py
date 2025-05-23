@@ -1,53 +1,279 @@
 """
-SBC Module for NES Copilot
+SBC (Simulation-Based Calibration) Module for NES Copilot with sbi Integration
 
-This module handles Simulation-Based Calibration for trained NPE models.
+This module implements Simulation-Based Calibration for trained NPE models
+to validate posterior estimates.
 """
 
 import os
-import torch
+import logging
 import numpy as np
 import pandas as pd
+import torch
 import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union, Any
+from tqdm import tqdm
+
 from scipy import stats
-from typing import Dict, Any, List, Optional, Union
+from sbi.inference import SNPE_C as SNPE
+from sbi.utils import BoxUniform
 
-from nes_copilot.module_base import ModuleBase
+from nes_copilot.simulation_module import SimulationModule
+from nes_copilot.data_prep_module import DataPrepModule
+from nes_copilot.checkpoint_manager import CheckpointManager
 
+logger = logging.getLogger(__name__)
 
-class SBCModule(ModuleBase):
+class SBCModule:
     """
-    SBC module for the NES Copilot system.
+    SBC module for the NES Copilot system with sbi integration.
     
-    Handles Simulation-Based Calibration for trained NPE models.
+    Implements Simulation-Based Calibration to validate posterior estimates
+    from trained NPE models.
     """
     
-    def __init__(self, config_manager, data_manager, logging_manager):
+    def __init__(self, config_manager):
         """
         Initialize the SBC module.
         
         Args:
             config_manager: Configuration manager instance.
-            data_manager: Data manager instance.
-            logging_manager: Logging manager instance.
         """
-        super().__init__(config_manager, data_manager, logging_manager)
-        
-        # Get module configuration
-        self.config = self.config_manager.get_module_config('sbc')
-        
-        # Get device from master config
-        self.device = self.config_manager.get_param('device', 'cpu')
-        
-        # Import required modules
-        from nes_copilot.simulation import SimulationModule
-        from nes_copilot.summary_stats import SummaryStatsModule
-        from nes_copilot.npe import CheckpointManager
+        self.config = config_manager
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.output_dir = Path(self.config.get_output_dir()) / 'sbc_results'
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Initialize required modules
-        self.simulation_module = SimulationModule(config_manager, data_manager, logging_manager)
-        self.summary_stats_module = SummaryStatsModule(config_manager, data_manager, logging_manager)
-        self.checkpoint_manager = CheckpointManager(self.logger)
+        self.data_prep = DataPrepModule(config_manager)
+        self.simulator = SimulationModule(config_manager)
+        
+        logger.info(f"Initialized SBCModule with output directory: {self.output_dir}")
+    
+    def run_sbc(
+        self,
+        npe,
+        n_simulations: int = 100,
+        n_posterior_samples: int = 1000,
+        n_workers: int = 4,
+        save_results: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Run Simulation-Based Calibration for a trained NPE model.
+        
+        Args:
+            npe: Trained NPE model.
+            n_simulations: Number of SBC simulations to run.
+            n_posterior_samples: Number of posterior samples to draw per simulation.
+            n_workers: Number of parallel workers for simulation.
+            save_results: Whether to save the results to disk.
+            
+        Returns:
+            Dictionary containing SBC results and diagnostics.
+        """
+        logger.info(f"Starting SBC with {n_simulations} simulations")
+        
+        # Prepare trial template
+        trial_template = self.data_prep.prepare_trial_template()
+        
+        # Get prior distribution
+        prior = self._create_prior()
+        
+        # Generate ground truth parameters and data
+        thetas = prior.sample((n_simulations,))
+        x_obs = self.simulator.run_batch_simulations(
+            thetas.numpy(),
+            trial_template,
+            n_workers=n_workers
+        )
+        
+        # Calculate ranks for each parameter
+        ranks = self._calculate_ranks(npe, prior, thetas, x_obs, n_posterior_samples)
+        
+        # Calculate diagnostics
+        diagnostics = self._calculate_diagnostics(ranks, thetas.shape[1])
+        
+        # Save results if requested
+        if save_results:
+            results = {
+                'thetas': thetas.numpy(),
+                'x_obs': x_obs.numpy() if torch.is_tensor(x_obs) else x_obs,
+                'ranks': ranks.numpy(),
+                'diagnostics': diagnostics,
+                'config': dict(self.config.config)
+            }
+            
+            timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            output_path = self.output_dir / f'sbc_results_{timestamp}.npz'
+            
+            np.savez_compressed(output_path, **results)
+            logger.info(f"Saved SBC results to {output_path}")
+        
+        return {
+            'thetas': thetas,
+            'x_obs': x_obs,
+            'ranks': ranks,
+            'diagnostics': diagnostics
+        }
+    
+    def _calculate_ranks(
+        self,
+        npe,
+        prior,
+        thetas: torch.Tensor,
+        x_obs: torch.Tensor,
+        n_posterior_samples: int
+    ) -> torch.Tensor:
+        """
+        Calculate rank statistics for SBC.
+        
+        Args:
+            npe: Trained NPE model.
+            prior: Prior distribution.
+            thetas: Ground truth parameters (n_simulations, n_params).
+            x_obs: Observed data (n_simulations, n_features).
+            n_posterior_samples: Number of posterior samples to draw.
+            
+        Returns:
+            Tensor of ranks with shape (n_simulations, n_params).
+        """
+        n_simulations, n_params = thetas.shape
+        ranks = torch.zeros_like(thetas)
+        
+        logger.info(f"Calculating ranks for {n_simulations} simulations...")
+        
+        for i in tqdm(range(n_simulations), desc="Running SBC"):
+            # Sample from posterior
+            posterior = npe.build_posterior()
+            theta_samples = posterior.sample(
+                (n_posterior_samples,),
+                x=x_obs[i].unsqueeze(0).to(self.device),
+                show_progress_bars=False
+            )
+            
+            # Calculate ranks
+            for j in range(n_params):
+                # Count how many samples are below the true value
+                rank = (theta_samples[:, j] < thetas[i, j]).sum().item()
+                ranks[i, j] = rank
+        
+        return ranks
+    
+    def _calculate_diagnostics(
+        self,
+        ranks: torch.Tensor,
+        n_params: int
+    ) -> Dict[str, Any]:
+        """
+        Calculate SBC diagnostics.
+        
+        Args:
+            ranks: Rank statistics from SBC.
+            n_params: Number of parameters.
+            
+        Returns:
+            Dictionary containing diagnostic metrics.
+        """
+        n_simulations = len(ranks)
+        n_bins = 10
+        
+        # Calculate ECDF for each parameter
+        ecdfs = []
+        for j in range(n_params):
+            ecdf = np.sort(ranks[:, j].numpy() / n_simulations)
+            ecdfs.append(ecdf)
+        
+        # Calculate KS test statistics
+        ks_stats = []
+        for j in range(n_params):
+            stat = stats.kstest(ecdfs[j], 'uniform').statistic
+            ks_stats.append(stat)
+        
+        # Calculate histogram-based diagnostics
+        histograms = []
+        bin_edges = np.linspace(0, n_simulations, n_bins + 1)
+        
+        for j in range(n_params):
+            hist, _ = np.histogram(ranks[:, j].numpy(), bins=bin_edges, density=True)
+            histograms.append(hist)
+        
+        # Calculate expected bin counts under uniform distribution
+        expected = np.ones(n_bins) / n_bins
+        
+        # Calculate chi-squared statistics
+        chi2_stats = []
+        for hist in histograms:
+            chi2 = np.sum((hist - expected) ** 2 / expected) * n_simulations / n_bins
+            chi2_stats.append(chi2)
+        
+        return {
+            'ks_stats': ks_stats,
+            'chi2_stats': chi2_stats,
+            'histograms': histograms,
+            'bin_edges': bin_edges,
+            'expected_hist': expected
+        }
+    
+    def plot_sbc_results(
+        self,
+        ranks: torch.Tensor,
+        param_names: List[str],
+        save_path: Optional[Path] = None
+    ) -> Dict[str, plt.Figure]:
+        """
+        Plot SBC results.
+        
+        Args:
+            ranks: Rank statistics from SBC.
+            param_names: List of parameter names.
+            save_path: Optional path to save the plots.
+            
+        Returns:
+            Dictionary of matplotlib figures.
+        """
+        n_params = len(param_names)
+        n_bins = 20
+        
+        # Create figures
+        fig_hist, axs_hist = plt.subplots(
+            n_params, 1,
+            figsize=(10, 3 * n_params),
+            sharex=True,
+            tight_layout=True
+        )
+        
+        if n_params == 1:
+            axs_hist = [axs_hist]
+        
+        # Plot histograms
+        for i, (ax, name) in enumerate(zip(axs_hist, param_names)):
+            ax.hist(
+                ranks[:, i].numpy(),
+                bins=n_bins,
+                alpha=0.7,
+                density=True,
+                label=f'p = {stats.kstest(ranks[:, i].numpy() / len(ranks), "uniform").pvalue:.3f}'
+            )
+            ax.axhline(1.0 / n_bins, color='r', linestyle='--', label='Expected')
+            ax.set_title(f"{name} (KS p-value: {stats.kstest(ranks[:, i].numpy() / len(ranches), 'uniform').pvalue:.3f})")
+            ax.legend()
+        
+        fig_hist.suptitle("SBC Rank Histograms")
+        
+        # Save figures if path is provided
+        if save_path is not None:
+            fig_hist.savefig(save_path / 'sbc_histograms.png', bbox_inches='tight')
+            plt.close(fig_hist)
+        
+        return {
+            'histograms': fig_hist
+        }
+    
+    def _create_prior(self) -> BoxUniform:
+        """Create a BoxUniform prior from the configuration."""
+        low, high = self.config.get_prior_bounds()
+        return BoxUniform(low=low, high=high, device=self.device)
         
     def run(self, npe_checkpoint: Optional[str] = None, trial_template: Optional[pd.DataFrame] = None, **kwargs) -> Dict[str, Any]:
         """
