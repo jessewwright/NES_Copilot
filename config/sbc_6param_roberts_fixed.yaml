@@ -1,0 +1,73 @@
+# Configuration for 6-parameter NES model with SBC analysis
+output_dir: "./results/sbc_6param_roberts"
+run_id: "sbc_6param"
+
+experiment:
+  name: "sbc_6param_roberts"
+  random_seed: 42
+  n_train_simulations: 1000  # Reduced for test run
+  n_sbc_datasets: 100       # Reduced for test run
+  n_posterior_samples: 200  # Reduced for test run
+  n_template_trials: 100    # Reduced for test run
+
+data:
+  processed_data: "./data/roberts_processed.csv"
+  n_participants: 45
+  n_trials_per_participant: 285
+
+model:
+  name: "MVNES"
+  # Using single values for parameters (ranges will be handled in the code)
+  parameters:
+    v_norm: 1.0       # Default value, will be overridden by prior
+    a_0: 1.0          # Default value, will be overridden by prior
+    w_s_eff: 1.0       # Default value, will be overridden by prior
+    t_0: 0.3          # Default value, will be overridden by prior
+    alpha_gain: 0.8    # Default value, will be overridden by prior
+    beta_val: 0.0      # Default value, will be overridden by prior
+  
+  # Prior distributions for parameters
+  priors:
+    v_norm: [0.1, 2.0]       # Normalization constant
+    a_0: [0.1, 2.5]          # Decision threshold
+    w_s_eff: [0.2, 1.5]       # Framing effect weight (positive only)
+    t_0: [0.1, 0.7]          # Non-decision time
+    alpha_gain: [0.5, 1.0]    # Risk sensitivity for gains
+    beta_val: [-0.5, 0.5]     # Starting point bias
+  
+  # Fixed parameters
+  fixed_parameters:
+    logit_z0: 0.0      # Fixed parameter for starting point
+    log_tau_norm: 0.0  # Fixed parameter for norm decay
+
+npe:
+  training:
+    max_epochs: 200
+    batch_size: 256
+    learning_rate: 0.0005
+    validation_fraction: 0.1
+    early_stopping_patience: 20
+  inference:
+    num_samples: 1000
+    num_workers: 4
+    sample_method: "mcmc"  # Using MCMC for posterior sampling
+
+# Summary statistics configuration
+summary_stats:
+  rt_bins: [0.1, 0.3, 0.5, 0.7, 0.9]  # Used for internal calculations
+  conditions:  # Used for organizing summary stats
+    - frame: "gain"
+      cond: "tc"
+    - frame: "loss"
+      cond: "tc"
+    - frame: "gain"
+      cond: "ntc"
+    - frame: "loss"
+      cond: "ntc"
+
+# Logging configuration
+logging:
+  level: "INFO"
+  file: "nes_copilot.log"
+  console: true
+  filemode: "w"  # Overwrite log file on each run

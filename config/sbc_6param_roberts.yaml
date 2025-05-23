@@ -1,0 +1,62 @@
+# Configuration for 6-parameter NES model with SBC analysis
+output_dir: "./results/sbc_6param_roberts"
+run_id: "sbc_6param"
+
+experiment:
+  name: "sbc_6param_roberts"
+  random_seed: 42
+  n_train_simulations: 30000
+  n_sbc_datasets: 300
+  n_posterior_samples: 500
+  n_template_trials: 250
+
+data:
+  processed_data: "./data/roberts_processed.csv"
+  n_participants: 45
+  n_trials_per_participant: 285
+
+model:
+  name: "MVNES"
+  # Using constrained priors from the working implementation
+  parameters:
+    v_norm: [0.1, 2.0]       # Normalization constant
+    a_0: [0.1, 2.5]          # Decision threshold
+    w_s_eff: [0.2, 1.5]       # Framing effect weight (positive only)
+    t_0: [0.1, 0.7]          # Non-decision time (constrained to reasonable RT range)
+    alpha_gain: [0.5, 1.0]    # Risk sensitivity for gains (constrained to < 1.0 as per hypothesis)
+    beta_val: [-0.5, 0.5]     # Starting point bias (centered around 0)
+  
+  # Fixed parameters
+  fixed_parameters:
+    logit_z0: 0.0      # Fixed parameter for starting point
+    log_tau_norm: 0.0  # Fixed parameter for norm decay
+
+npe:
+  training:
+    max_epochs: 200
+    batch_size: 256
+    learning_rate: 0.0005
+    validation_fraction: 0.1
+    early_stopping_patience: 20
+  inference:
+    num_samples: 1000
+    num_workers: 4
+    sample_method: "mcmc"  # Using MCMC for posterior sampling
+
+# Summary statistics configuration (references the hardcoded stats in stats_schema)
+summary_stats:
+  rt_bins: [0.1, 0.3, 0.5, 0.7, 0.9]  # Used for internal calculations
+  conditions:  # Used for organizing summary stats
+    - frame: "gain"
+      cond: "tc"
+    - frame: "gain"
+      cond: "ntc"
+    - frame: "loss"
+      cond: "tc"
+    - frame: "loss"
+      cond: "ntc"
+
+logging:
+  level: "INFO"
+  file: "./results/sbc_6param_roberts/analysis.log"
+  console: true

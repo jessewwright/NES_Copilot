@@ -1,0 +1,53 @@
+# config/roberts_npe_config.yaml
+output_dir: "./results/roberts_npe_30k"
+run_id: "roberts_30k_seed42"
+
+experiment:
+  name: "roberts_npe_30k"
+  random_seed: 42  # Fixed random seed for reproducibility
+  n_simulations: 30000  # Increased from 1000 to 30000
+
+data:
+  processed_data: "./data/roberts_processed.csv"
+  n_participants: 45  # Based on the actual data
+  n_trials_per_participant: 285  # Rounded up from 284.8
+
+model:
+  name: "MVNES"
+  parameters:
+    v_norm: [0.1, 5.0]       # Normalization constant
+    a_0: [0.1, 5.0]          # Decision threshold
+    w_s_eff: [-1.0, 1.0]     # Framing effect weight
+    t_0: [0.1, 2.0]          # Non-decision time
+    alpha_gain: [0.1, 5.0]    # Risk sensitivity for gains
+    beta_val: [0.1, 5.0]      # Inverse temperature
+
+npe:
+  training:
+    max_epochs: 200  # Increased epochs for better convergence
+    batch_size: 256  # Increased batch size for efficiency
+    learning_rate: 0.0005
+    validation_fraction: 0.1
+    early_stopping_patience: 20  # Increased patience for early stopping
+  inference:
+    num_samples: 1000
+    num_workers: 4
+    sample_method: "sir"  # Sequential Importance Resampling
+    num_prior_samples: 10000
+
+summary_stats:
+  rt_bins: [0.1, 0.3, 0.5, 0.7, 0.9]  # Quantiles for RT analysis
+  conditions:
+    - frame: "gain"
+      cond: "tc"
+    - frame: "gain"
+      cond: "ntc"
+    - frame: "loss"
+      cond: "tc"
+    - frame: "loss"
+      cond: "ntc"
+
+logging:
+  level: "INFO"
+  file: "./results/roberts_npe/analysis.log"
+  console: true
