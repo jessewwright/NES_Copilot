@@ -1,54 +1,215 @@
 """
-Data Preparation Module for NES Copilot
+Data Preparation Module for NES Copilot with sbi Integration
 
-This module handles loading and preprocessing empirical data, calculating valence scores,
-and generating trial templates.
+This module handles loading and preprocessing data, calculating valence scores,
+and generating trial templates for the NES model.
 """
 
 import os
-import pandas as pd
+import logging
 import numpy as np
-from typing import Dict, Any, List, Optional, Union
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import pandas as pd
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union, Any
+
 import torch
+from scipy.stats import zscore
 
-from nes_copilot.module_base import ModuleBase
+logger = logging.getLogger(__name__)
 
-
-class DataPrepModule(ModuleBase):
+class DataPrepModule:
     """
-    Data preparation module for the NES Copilot system.
+    Data preparation module for the NES Copilot system with sbi integration.
     
-    Handles loading and preprocessing empirical data, calculating valence scores,
-    and generating trial templates.
+    Handles loading and preprocessing data, calculating valence scores,
+    and generating trial templates for the NES model.
     """
     
-    def __init__(self, config_manager, data_manager, logging_manager):
+    def __init__(self, config_manager):
         """
         Initialize the data preparation module.
         
         Args:
             config_manager: Configuration manager instance.
-            data_manager: Data manager instance.
-            logging_manager: Logging manager instance.
         """
-        super().__init__(config_manager, data_manager, logging_manager)
-        
-        # Get module configuration
-        self.config = self.config_manager.get_module_config('data_prep')
-        
-    def run(self, raw_data_path: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        self.config = config_manager
+        self.data_dir = Path(self.config.get_data_dir())
+        logger.info(f"Initialized DataPrepModule with data directory: {self.data_dir}")
+    
+    def prepare_trial_template(self, subject_id: Optional[str] = None) -> pd.DataFrame:
         """
-        Run the data preparation module.
+        Prepare the trial template for simulations.
         
         Args:
-            raw_data_path: Optional override for the raw data path in config.
-            **kwargs: Additional arguments (not used).
+            subject_id: Optional subject ID to load specific subject data.
+                      If None, uses the template from config.
+                      
+        Returns:
+            DataFrame containing the trial template.
+        """
+        if subject_id is not None:
+            # Load empirical data for a specific subject
+            trial_template = self._load_empirical_data(subject_id)
+        else:
+            # Load template from config
+            trial_template = self._load_trial_template()
+        
+        # Ensure required columns are present
+        required_columns = [
+            'trial', 'block', 'frame', 'cond', 'prob', 'is_gain_frame',
+            'time_constrained', 'sure_amount', 'endowment', 'valence_score',
+            'norm_category_for_trial'
+        ]
+        
+        missing_cols = [col for col in required_columns if col not in trial_template.columns]
+        if missing_cols:
+            raise ValueError(f"Trial template is missing required columns: {missing_cols}")
+        
+        logger.info(f"Prepared trial template with {len(trial_template)} trials")
+        return trial_template
+    
+    def _load_empirical_data(self, subject_id: str) -> pd.DataFrame:
+        """
+        Load and preprocess empirical data for a subject.
+        
+        Args:
+            subject_id: Subject ID to load data for.
             
         Returns:
-            Dict containing the results of the data preparation.
+            DataFrame with preprocessed trial data.
         """
-        self.logger.info("Starting data preparation")
+        # Load the data
+        data_path = self.data_dir / 'empirical' / f'subject_{subject_id}.csv'
+        if not data_path.exists():
+            raise FileNotFoundError(f"No data found for subject {subject_id} at {data_path}")
+        
+        df = pd.read_csv(data_path)
+        
+        # Apply preprocessing
+        df = self._preprocess_data(df)
+        
+        return df
+    
+    def _load_trial_template(self) -> pd.DataFrame:
+        """
+        Load the trial template from the configuration.
+        
+        Returns:
+            DataFrame containing the trial template.
+        """
+        template_path = self.data_dir / 'templates' / 'trial_template.csv'
+        if not template_path.exists():
+            raise FileNotFoundError(f"Trial template not found at {template_path}")
+        
+        df = pd.read_csv(template_path)
+        
+        # Ensure all required columns are present
+        required_columns = [
+            'trial', 'block', 'frame', 'cond', 'prob', 'is_gain_frame',
+            'time_constrained', 'sure_amount', 'endowment', 'valence_score',
+            'norm_category_for_trial'
+        ]
+        
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Trial template is missing required columns: {missing_cols}")
+        
+        return df
+    
+    def _preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Preprocess the raw data.
+        
+        Args:
+            df: Raw data DataFrame.
+            
+        Returns:
+            Preprocessed DataFrame.
+        """
+        # Make a copy to avoid modifying the original
+        df = df.copy()
+        
+        # Convert column names to lowercase for consistency
+        df.columns = [col.lower() for col in df.columns]
+        
+        # Ensure required columns are present
+        required_columns = [
+            'trial', 'block', 'frame', 'cond', 'prob', 'is_gain_frame',
+            'time_constrained', 'sure_amount', 'endowment', 'valence_score',
+            'norm_category_for_trial'
+        ]
+        
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Input data is missing required columns: {missing_cols}")
+        
+        # Convert data types
+        df['trial'] = df['trial'].astype(int)
+        df['block'] = df['block'].astype(int)
+        df['frame'] = df['frame'].astype(str)
+        df['cond'] = df['cond'].astype(str)
+        df['prob'] = df['prob'].astype(float)
+        df['is_gain_frame'] = df['is_gain_frame'].astype(bool)
+        df['time_constrained'] = df['time_constrained'].astype(bool)
+        df['sure_amount'] = df['sure_amount'].astype(float)
+        df['endowment'] = df['endowment'].astype(float)
+        df['valence_score'] = df['valence_score'].astype(float)
+        df['norm_category_for_trial'] = df['norm_category_for_trial'].astype(str)
+        
+        # Sort by trial number
+        df = df.sort_values('trial').reset_index(drop=True)
+        
+        return df
+    
+    def calculate_valence_scores(self, stimuli: List[str]) -> np.ndarray:
+        """
+        Calculate valence scores for a list of stimuli.
+        
+        Args:
+            stimuli: List of stimulus strings.
+            
+        Returns:
+            Array of valence scores.
+        """
+        # Load pre-computed valence scores if available
+        valence_path = self.data_dir / 'stimuli' / 'valence_scores.npy'
+        if valence_path.exists():
+            all_scores = np.load(valence_path, allow_pickle=True).item()
+            scores = np.array([all_scores.get(stim, 0.0) for stim in stimuli])
+            logger.info(f"Loaded {len(scores)} valence scores from {valence_path}")
+            return scores
+        
+        # Otherwise, calculate from scratch (placeholder implementation)
+        logger.warning("Using placeholder valence scores. For better results, provide pre-computed scores.")
+        return np.random.uniform(-1, 1, size=len(stimuli))
+    
+    def normalize_data(self, data: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Normalize data using z-scores.
+        
+        Args:
+            data: Input data array.
+            
+        Returns:
+            Tuple of (normalized_data, stats_dict) where stats_dict contains
+            the mean and std used for normalization.
+        """
+        mean_val = np.mean(data)
+        std_val = np.std(data, ddof=1)  # Use ddof=1 for sample standard deviation
+        
+        # Avoid division by zero
+        if std_val < 1e-10:
+            std_val = 1.0
+            
+        normalized = (data - mean_val) / std_val
+        
+        stats = {
+            'mean': mean_val,
+            'std': std_val,
+            'n_samples': len(data)
+        }
+        
+        return normalized, stats
         
         # Validate inputs
         self.validate_inputs(raw_data_path=raw_data_path)

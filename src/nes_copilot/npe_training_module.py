@@ -1,54 +1,213 @@
 """
-NPE Training Module for NES Copilot
+NPE Training Module for NES Copilot with sbi Integration
 
-This module handles training of Neural Posterior Estimation models.
+This module handles training of Neural Posterior Estimation models using sbi.
 """
 
 import os
 import torch
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List, Optional, Union
+import logging
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple, Union
+from datetime import datetime
+
 import sbi
-from sbi.inference import SNPE
-from sbi.utils import BoxUniform
+from sbi.inference import SNPE_C as SNPE
+from sbi.utils import BoxUniform, process_prior
 
-from nes_copilot.module_base import ModuleBase
+from nes_copilot.simulation_module import SimulationModule
+from nes_copilot.data_prep_module import DataPrepModule
+from nes_copilot.checkpoint_manager import CheckpointManager
 
+logger = logging.getLogger(__name__)
 
-class NPETrainingModule(ModuleBase):
+class NPETrainingModule:
     """
-    NPE Training module for the NES Copilot system.
+    NPE Training module for the NES Copilot system with sbi integration.
     
-    Handles training of Neural Posterior Estimation models.
+    Handles training of Neural Posterior Estimation models using sbi.
     """
     
-    def __init__(self, config_manager, data_manager, logging_manager):
+    def __init__(self, config_manager):
         """
         Initialize the NPE training module.
         
         Args:
             config_manager: Configuration manager instance.
-            data_manager: Data manager instance.
-            logging_manager: Logging manager instance.
         """
-        super().__init__(config_manager, data_manager, logging_manager)
+        self.config = config_manager
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.output_dir = Path(self.config.get_output_dir())
         
-        # Get module configuration
-        self.config = self.config_manager.get_module_config('npe')
+        # Initialize modules
+        self.data_prep = DataPrepModule(config_manager)
+        self.simulator = SimulationModule(config_manager)
         
-        # Get device from master config
-        self.device = self.config_manager.get_param('device', 'cpu')
+        # Setup checkpointing
+        self.checkpoint_dir = self.output_dir / 'checkpoints'
+        self.checkpoint_dir.mkdir(exist_ok=True)
+        self.checkpoint_manager = CheckpointManager(self.checkpoint_dir)
         
-        # Import required modules
-        from nes_copilot.simulation import SimulationModule
-        from nes_copilot.summary_stats import SummaryStatsModule
+        logger.info(f"Initialized NPETrainingModule with output directory: {self.output_dir}")
+    
+    def train_npe(
+        self,
+        trial_template: Optional[pd.DataFrame] = None,
+        n_simulations: Optional[int] = None,
+        resume_from_checkpoint: bool = True
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """
+        Train a Neural Posterior Estimator (NPE) using sbi.
         
-        # Initialize simulation and summary stats modules
-        self.simulation_module = SimulationModule(config_manager, data_manager, logging_manager)
-        self.summary_stats_module = SummaryStatsModule(config_manager, data_manager, logging_manager)
+        Args:
+            trial_template: Optional trial template DataFrame. If None, will be loaded from config.
+            n_simulations: Number of simulations to run. If None, uses value from config.
+            resume_from_checkpoint: Whether to resume training from a checkpoint if available.
+            
+        Returns:
+            Tuple of (density_estimator, training_metadata)
+        """
+        # Load or generate trial template if not provided
+        if trial_template is None:
+            trial_template = self.data_prep.prepare_trial_template()
         
-    def run(self, trial_template: Optional[pd.DataFrame] = None, **kwargs) -> Dict[str, Any]:
+        # Get number of simulations from config if not provided
+        if n_simulations is None:
+            n_simulations = self.config.experiment_config['n_train_simulations']
+        
+        # Setup prior distribution
+        prior = self._create_prior()
+        
+        # Check for existing checkpoint
+        if resume_from_checkpoint:
+            checkpoint = self.checkpoint_manager.get_latest_checkpoint()
+            if checkpoint is not None:
+                logger.info(f"Resuming from checkpoint: {checkpoint['checkpoint_path']}")
+                return self._resume_training(checkpoint, trial_template, n_simulations)
+        
+        # Initialize SNPE
+        density_estimator = SNPE(prior=prior, device=self.device)
+        
+        # Run simulations and train NPE
+        logger.info(f"Starting NPE training with {n_simulations} simulations")
+        
+        # Get simulator function
+        simulator = self.simulator.get_simulator(trial_template)
+        
+        # Run simulations and train NPE in batches to allow for checkpointing
+        batch_size = min(1000, n_simulations)  # Process in batches of 1000
+        n_batches = (n_simulations + batch_size - 1) // batch_size
+        
+        for batch_idx in range(n_batches):
+            current_batch = min(batch_size, n_simulations - batch_idx * batch_size)
+            logger.info(f"Running batch {batch_idx + 1}/{n_batches} with {current_batch} simulations")
+            
+            # Sample parameters from prior
+            theta = prior.sample((current_batch,))
+            
+            # Run simulations
+            x = simulator(theta)
+            
+            # Append simulations to NPE
+            density_estimator = density_estimator.append_simulations(
+                theta, x, data_device=self.device
+            )
+            
+            # Save checkpoint after each batch
+            if (batch_idx + 1) % 5 == 0:  # Save checkpoint every 5 batches
+                self._save_checkpoint(density_estimator, batch_idx + 1, n_simulations)
+        
+        # Train the density estimator
+        logger.info("Training density estimator...")
+        density_estimator = density_estimator.train()
+        
+        # Save final checkpoint
+        training_metadata = self._save_checkpoint(density_estimator, n_batches, n_simulations)
+        
+        return density_estimator, training_metadata
+    
+    def _create_prior(self) -> BoxUniform:
+        """Create a BoxUniform prior from the configuration."""
+        low, high = self.config.get_prior_bounds()
+        return BoxUniform(low=low, high=high, device=self.device)
+    
+    def _save_checkpoint(
+        self, 
+        density_estimator: Any, 
+        batch_idx: int, 
+        total_batches: int
+    ) -> Dict[str, Any]:
+        """
+        Save a training checkpoint.
+        
+        Args:
+            density_estimator: The current density estimator
+            batch_idx: Current batch index
+            total_batches: Total number of batches
+            
+        Returns:
+            Dictionary with metadata about the checkpoint
+        """
+        checkpoint_data = {
+            'state_dict': density_estimator.state_dict(),
+            'batch_idx': batch_idx,
+            'total_batches': total_batches,
+            'timestamp': datetime.now().isoformat(),
+            'config': dict(self.config.config)  # Save a copy of the config
+        }
+        
+        checkpoint_path = self.checkpoint_manager.save_checkpoint(
+            checkpoint_data,
+            f"npe_checkpoint_batch_{batch_idx:04d}.pt"
+        )
+        
+        logger.info(f"Saved checkpoint to {checkpoint_path} (batch {batch_idx}/{total_batches})")
+        return checkpoint_data
+    
+    def _resume_training(
+        self, 
+        checkpoint: Dict[str, Any],
+        trial_template: pd.DataFrame,
+        n_simulations: int
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """
+        Resume training from a checkpoint.
+        
+        Args:
+            checkpoint: Checkpoint data
+            trial_template: Trial template DataFrame
+            n_simulations: Total number of simulations to run
+            
+        Returns:
+            Tuple of (density_estimator, training_metadata)
+        """
+        # Initialize SNPE with the same prior
+        prior = self._create_prior()
+        density_estimator = SNPE(prior=prior, device=self.device)
+        
+        # Load state dict
+        density_estimator.load_state_dict(checkpoint['state_dict'])
+        
+        # Get number of remaining simulations
+        completed_sims = checkpoint.get('batch_idx', 0) * (
+            n_simulations // checkpoint.get('total_batches', 1)
+        )
+        remaining_sims = n_simulations - completed_sims
+        
+        if remaining_sims <= 0:
+            logger.info("Checkpoint already has the requested number of simulations. Returning...")
+            return density_estimator, checkpoint
+        
+        logger.info(f"Resuming training with {remaining_sims} remaining simulations")
+        
+        # Continue training with remaining simulations
+        return self.train_npe(
+            trial_template=trial_template,
+            n_simulations=remaining_sims,
+            resume_from_checkpoint=False  # Don't resume from checkpoint again
+        )
         """
         Train an NPE model using the specified configuration.
         

@@ -2,53 +2,159 @@
 Configuration Manager for NES Copilot
 
 This module handles loading, validating, and providing access to configuration parameters
-for the NES Copilot system.
+for the NES Copilot system, specifically for the NES model with SBI integration.
 """
 
 import os
 import yaml
-from typing import Dict, Any, Optional, Union
+from pathlib import Path
+from typing import Dict, Any, List, Tuple, Union, Optional
+import torch
+import numpy as np
+from dataclasses import dataclass
+
+
+@dataclass
+class PriorConfig:
+    """Dataclass to hold prior distribution configuration."""
+    low: np.ndarray
+    high: np.ndarray
+    parameter_names: List[str]
+    
+    def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Convert bounds to PyTorch tensors."""
+        return (
+            torch.as_tensor(self.low, dtype=torch.float32),
+            torch.as_tensor(self.high, dtype=torch.float32)
+        )
 
 
 class ConfigManager:
     """
-    Configuration manager for the NES Copilot system.
+    Configuration manager for the NES Copilot system with SBI integration.
     
     Handles loading and validating configuration files, and provides a unified
     interface for accessing configuration parameters.
     """
     
-    def __init__(self, master_config_path: str):
+    def __init__(self, config_path: str):
         """
         Initialize the configuration manager.
         
         Args:
-            master_config_path: Path to the master configuration file.
+            config_path: Path to the main configuration YAML file.
         """
-        self.master_config_path = master_config_path
-        self.master_config = self._load_yaml(master_config_path)
-        self.module_configs = {}
-        self._load_module_configs()
+        self.config_path = Path(config_path)
+        self.config = self._load_config()
+        self._validate_config()
+        self.prior = self._create_prior_config()
         
-    def _load_yaml(self, config_path: str) -> Dict[str, Any]:
-        """
-        Load a YAML configuration file.
-        
-        Args:
-            config_path: Path to the YAML configuration file.
+    def _load_config(self) -> Dict[str, Any]:
+        """Load and return the configuration from YAML file."""
+        if not self.config_path.exists():
+            raise FileNotFoundError(f"Configuration file not found: {self.config_path}")
             
-        Returns:
-            Dict containing the configuration parameters.
-        """
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Configuration file not found: {config_path}")
-        
-        with open(config_path, 'r') as f:
+        with open(self.config_path, 'r') as f:
             config = yaml.safe_load(f)
             
         return config
     
-    def _load_module_configs(self):
+    def _validate_config(self):
+        """Validate the configuration structure and values."""
+        required_sections = [
+            'experiment', 'data', 'model', 'npe', 'summary_stats', 'logging'
+        ]
+        
+        for section in required_sections:
+            if section not in self.config:
+                raise ValueError(f"Missing required section in config: {section}")
+        
+        # Validate model parameters
+        model_params = self.model_parameters
+        if not all(isinstance(v, (int, float)) for v in model_params.values()):
+            raise ValueError("Model parameters must be numeric values")
+    
+    def _create_prior_config(self) -> PriorConfig:
+        """Create a PriorConfig instance from the model parameters."""
+        param_config = self.config['model']['parameters']
+        
+        # Get parameter names and bounds in a consistent order
+        param_names = list(param_config.keys())
+        low_bounds = []
+        high_bounds = []
+        
+        for param in param_names:
+            bounds = param_config[param]
+            if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+                raise ValueError(f"Parameter {param} must have [low, high] bounds")
+                
+            low_bounds.append(float(bounds[0]))
+            high_bounds.append(float(bounds[1]))
+        
+        return PriorConfig(
+            low=np.array(low_bounds, dtype=np.float32),
+            high=np.array(high_bounds, dtype=np.float32),
+            parameter_names=param_names
+        )
+    
+    @property
+    def experiment_config(self) -> Dict[str, Any]:
+        """Get experiment configuration."""
+        return self.config['experiment']
+    
+    @property
+    def data_config(self) -> Dict[str, Any]:
+        """Get data configuration."""
+        return self.config['data']
+    
+    @property
+    def model_parameters(self) -> Dict[str, List[float]]:
+        """Get model parameters configuration."""
+        return self.config['model']['parameters']
+    
+    @property
+    def fixed_parameters(self) -> Dict[str, float]:
+        """Get fixed model parameters."""
+        return self.config['model'].get('fixed_parameters', {})
+    
+    @property
+    def npe_config(self) -> Dict[str, Any]:
+        """Get NPE training and inference configuration."""
+        return self.config['npe']
+    
+    @property
+    def summary_stats_config(self) -> Dict[str, Any]:
+        """Get summary statistics configuration."""
+        return self.config['summary_stats']
+    
+    @property
+    def logging_config(self) -> Dict[str, Any]:
+        """Get logging configuration."""
+        return self.config['logging']
+    
+    def get_output_dir(self) -> Path:
+        """Get the output directory, creating it if it doesn't exist."""
+        output_dir = Path(self.config['output_dir'])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir
+    
+    def get_run_id(self) -> str:
+        """Get the run ID, generating one if not specified."""
+        if 'run_id' in self.config and self.config['run_id']:
+            return self.config['run_id']
+        
+        # Generate a run ID based on timestamp and experiment name
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{self.experiment_config['name']}_{timestamp}"
+    
+    def get_prior_bounds(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get the prior bounds as PyTorch tensors."""
+        return self.prior.to_tensor()
+    
+    def get_parameter_names(self) -> List[str]:
+        """Get the list of parameter names in consistent order."""
+        return self.prior.parameter_names
         """
         Load all module-specific configuration files specified in the master config.
         """
