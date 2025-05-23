@@ -1,53 +1,140 @@
 """
-Checkpoint Manager for NES Copilot
+Checkpoint Manager for NES Copilot with sbi Integration
 
-This module handles saving and loading NPE checkpoints.
+This module handles saving and loading NPE training checkpoints with metadata.
 """
 
 import os
-import torch
 import json
-from typing import Dict, Any, Optional, Union
+import torch
+import logging
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple, Union
+from datetime import datetime
 
-import sbi
-from sbi.inference import SNPE
-from sbi.utils import BoxUniform
-
+logger = logging.getLogger(__name__)
 
 class CheckpointManager:
     """
-    Checkpoint manager for the NES Copilot system.
+    Checkpoint manager for the NES Copilot system with sbi integration.
     
-    Handles saving and loading NPE checkpoints.
+    Handles saving and loading of NPE training checkpoints with metadata.
     """
     
-    def __init__(self, logger):
+    def __init__(self, checkpoint_dir: Union[str, Path]):
         """
         Initialize the checkpoint manager.
         
         Args:
-            logger: Logger instance.
+            checkpoint_dir: Directory where checkpoints will be stored.
         """
-        self.logger = logger
-        
-    def save_checkpoint(self, density_estimator, prior, summary_stat_keys, param_names, 
-                        checkpoint_dir, training_args=None):
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Initialized CheckpointManager with directory: {self.checkpoint_dir}")
+    
+    def save_checkpoint(
+        self,
+        checkpoint_data: Dict[str, Any],
+        filename: Optional[str] = None
+    ) -> Path:
         """
-        Save an NPE checkpoint.
+        Save a checkpoint to disk.
         
         Args:
-            density_estimator: Trained density estimator.
-            prior: Prior distribution.
-            summary_stat_keys: List of summary statistic keys.
-            param_names: List of parameter names.
-            checkpoint_dir: Directory to save the checkpoint.
-            training_args: Optional training arguments.
+            checkpoint_data: Dictionary containing the checkpoint data.
+            filename: Optional filename. If None, generates one with a timestamp.
             
         Returns:
-            Dict mapping output names to their paths.
+            Path to the saved checkpoint file.
         """
-        # Create checkpoint directory if it doesn't exist
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"checkpoint_{timestamp}.pt"
+        
+        checkpoint_path = self.checkpoint_dir / filename
+        
+        # Save the checkpoint
+        torch.save(checkpoint_data, checkpoint_path)
+        logger.info(f"Saved checkpoint to {checkpoint_path}")
+        
+        # Also save metadata as JSON for easier inspection
+        metadata = {
+            k: str(v) if not isinstance(v, (int, float, str, bool)) else v 
+            for k, v in checkpoint_data.items() 
+            if k != 'state_dict'
+        }
+        metadata_path = checkpoint_path.with_suffix('.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        return checkpoint_path
+    
+    def get_latest_checkpoint(self) -> Optional[Dict[str, Any]]:
+        """
+        Get the most recent checkpoint.
+        
+        Returns:
+            Dictionary with checkpoint data, or None if no checkpoints exist.
+        """
+        checkpoints = sorted(self.checkpoint_dir.glob('*.pt'))
+        if not checkpoints:
+            return None
+            
+        latest_checkpoint = max(checkpoints, key=os.path.getmtime)
+        logger.info(f"Loading latest checkpoint: {latest_checkpoint}")
+        
+        try:
+            checkpoint_data = torch.load(latest_checkpoint, map_location='cpu')
+            checkpoint_data['checkpoint_path'] = latest_checkpoint
+            return checkpoint_data
+        except Exception as e:
+            logger.error(f"Error loading checkpoint {latest_checkpoint}: {e}")
+            return None
+    
+    def get_all_checkpoints(self) -> List[Dict[str, Any]]:
+        """
+        Get all available checkpoints, sorted by modification time (newest first).
+        
+        Returns:
+            List of checkpoint data dictionaries.
+        """
+        checkpoints = []
+        for checkpoint_file in sorted(
+            self.checkpoint_dir.glob('*.pt'),
+            key=os.path.getmtime,
+            reverse=True
+        ):
+            try:
+                checkpoint_data = torch.load(checkpoint_file, map_location='cpu')
+                checkpoint_data['checkpoint_path'] = checkpoint_file
+                checkpoints.append(checkpoint_data)
+            except Exception as e:
+                logger.error(f"Error loading checkpoint {checkpoint_file}: {e}")
+        
+        return checkpoints
+    
+    def cleanup_old_checkpoints(self, keep_last_n: int = 5) -> None:
+        """
+        Delete old checkpoints, keeping only the most recent ones.
+        
+        Args:
+            keep_last_n: Number of most recent checkpoints to keep.
+        """
+        checkpoints = sorted(self.checkpoint_dir.glob('*.pt'), key=os.path.getmtime)
+        
+        if len(checkpoints) <= keep_last_n:
+            return
+            
+        for checkpoint_file in checkpoints[:-keep_last_n]:
+            try:
+                # Also remove corresponding JSON metadata if it exists
+                json_file = checkpoint_file.with_suffix('.json')
+                if json_file.exists():
+                    os.remove(json_file)
+                os.remove(checkpoint_file)
+                logger.info(f"Removed old checkpoint: {checkpoint_file}")
+            except Exception as e:
+                logger.error(f"Error removing checkpoint {checkpoint_file}: {e}")
         
         # Save density estimator
         density_estimator_path = os.path.join(checkpoint_dir, 'density_estimator.pt')
