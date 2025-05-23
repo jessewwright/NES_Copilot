@@ -1,0 +1,93 @@
+"""
+Sample configuration file for NES Co-Pilot experiments.
+
+This file demonstrates the structure of a master configuration file.
+"""
+
+output_dir: "/data/output"
+run_id: "sample_run"
+seed: 12345
+device: "cpu"
+
+data:
+  roberts_data: "/data/roberts_data.csv"
+
+run_modules:
+  data_prep: true
+  simulation: true
+  summary_stats: true
+  npe_training: true
+  sbc: true
+  empirical_fit: true
+  ppc: true
+  analysis: true
+
+module_configs:
+  data_prep:
+    filtering:
+      trial_type: "all"
+      exclude_subjects: []
+    valence_processor:
+      use_existing_valence: true
+      valence_column: "valence"
+      rescaling:
+        min_value: -1.0
+        max_value: 1.0
+    trial_generator:
+      num_trials: 80
+      frame_distribution:
+        gain: 0.5
+        loss: 0.5
+      condition_distribution:
+        tc: 0.5
+        ntc: 0.5
+
+  simulation:
+    mvnes_agent:
+      fixed_params:
+        beta: 1.0
+        tau: 0.1
+      variable_params:
+        v_norm: 2.0
+        w_gain: 0.5
+        w_loss: 0.5
+        theta: 0.7
+    num_simulations: 1000
+
+  summary_stats:
+    stat_set: "full_60"
+    custom_stats: []
+
+  npe:
+    training:
+      num_simulations: 10000
+      num_workers: 4
+      batch_size: 100
+      learning_rate: 0.001
+      num_epochs: 50
+    network:
+      type: "maf"
+      hidden_features: 50
+      num_transforms: 5
+
+  sbc:
+    num_test_samples: 100
+    num_posterior_samples: 1000
+    significance_level: 0.05
+
+  empirical_fit:
+    num_posterior_samples: 10000
+    num_chains: 4
+    warmup_steps: 1000
+    max_tree_depth: 10
+    target_accept: 0.8
+
+  ppc:
+    num_posterior_samples: 1000
+    num_simulations_per_sample: 10
+    coverage_alpha: 0.05
+
+  analysis:
+    correlation_threshold: 0.3
+    cluster_method: "kmeans"
+    num_clusters: 3

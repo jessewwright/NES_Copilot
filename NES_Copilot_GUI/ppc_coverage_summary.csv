@@ -1,0 +1,11 @@
+statistic,coverage_percentage,covered,total
+p_gamble_Gain_TC,95.0,19,20
+p_gamble_Gain_NTC,90.0,18,20
+p_gamble_Loss_TC,95.0,19,20
+p_gamble_Loss_NTC,90.0,18,20
+mean_rt_Gain_TC,85.0,17,20
+mean_rt_Gain_NTC,90.0,18,20
+mean_rt_Loss_TC,95.0,19,20
+mean_rt_Loss_NTC,85.0,17,20
+framing_index,95.0,19,20
+time_pressure_index,90.0,18,20

@@ -1,0 +1,14 @@
+name = "nes-copilot-mission-control"
+compatibility_date = "2023-01-01"
+
+[site]
+bucket = "./build"
+
+[build]
+command = "pip install -r requirements.txt && mkdir -p build && cp -r * build/ && rm -rf build/build"
+
+[env.production]
+name = "nes-copilot-mission-control-prod"
+
+[env.staging]
+name = "nes-copilot-mission-control-staging"

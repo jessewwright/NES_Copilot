@@ -1,0 +1,28 @@
+{
+  "parameters": [
+    {
+      "name": "v_norm",
+      "ks_statistic": 0.0823,
+      "p_value": 0.5712,
+      "is_uniform": true
+    },
+    {
+      "name": "w_gain",
+      "ks_statistic": 0.0912,
+      "p_value": 0.3821,
+      "is_uniform": true
+    },
+    {
+      "name": "w_loss",
+      "ks_statistic": 0.0756,
+      "p_value": 0.6891,
+      "is_uniform": true
+    },
+    {
+      "name": "theta",
+      "ks_statistic": 0.0698,
+      "p_value": 0.7623,
+      "is_uniform": true
+    }
+  ]
+}
