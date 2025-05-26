@@ -1,0 +1,12 @@
+=== NES 6-Parameter Model Analysis Summary ===
+
+Number of subjects: 45
+Parameters analyzed: v_norm, a_0, w_s_eff, t_0, alpha_gain, beta_val
+
+Parameter Statistics (mean ± std):
+- v_norm: 0.798 ± 0.492
+- a_0: 1.203 ± 0.273
+- w_s_eff: 0.699 ± 0.268
+- t_0: 0.304 ± 0.113
+- alpha_gain: 0.725 ± 0.153
+- beta_val: -0.026 ± 0.520

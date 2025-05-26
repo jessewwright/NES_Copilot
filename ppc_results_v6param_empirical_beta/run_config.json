@@ -1,0 +1,12 @@
+{
+  "fitted_params_file": "empirical_fit_results\\empirical_fitting_results.csv",
+  "roberts_data_file": "roberts_framing_data\\ftp_osf_data.csv",
+  "output_dir": "ppc_results_v6param_empirical_beta",
+  "subject_ids": "114",
+  "n_sim_reps": 1,
+  "seed": 42,
+  "threshold_scale": 1.0,
+  "ppc_version": "v6param_empirical_beta",
+  "force_cpu": true,
+  "debug": true
+}

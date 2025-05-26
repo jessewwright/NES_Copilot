@@ -1,0 +1,37 @@
+{
+    "npe_train_sims": 600,
+    "template_trials": 25,
+    "sbc_datasets_attempted": 30,
+    "sbc_datasets_valid": 30,
+    "sbc_posterior_samples": 50,
+    "seed": 92,
+    "output_dir": "sbc_nes_6param_60SS_HybridPriors_nsf_60k_TEST",
+    "npe_save_path": "sbc_nes_6param_60SS_HybridPriors_nsf_60k_TEST\\models\\nes_npe_sims600_template25_seed92.pt",
+    "timestamp": "2025-05-24 09:16:42",
+    "ks_results": {
+        "v_norm": {
+            "ks_stat": 0.12,
+            "ks_pval": 0.736219034498267
+        },
+        "a_0": {
+            "ks_stat": 0.12,
+            "ks_pval": 0.736219034498267
+        },
+        "w_s_eff": {
+            "ks_stat": 0.19999999999999996,
+            "ks_pval": 0.15796916101547342
+        },
+        "t_0": {
+            "ks_stat": 0.32,
+            "ks_pval": 0.003119699116750252
+        },
+        "alpha_gain": {
+            "ks_stat": 0.12,
+            "ks_pval": 0.736219034498267
+        },
+        "beta_val": {
+            "ks_stat": 0.14,
+            "ks_pval": 0.5520586795747393
+        }
+    }
+}

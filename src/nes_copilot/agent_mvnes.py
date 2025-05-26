@@ -12,6 +12,8 @@ from typing import Dict, Any, List, Optional, Union, Tuple, Literal
 # Set up logging
 logger = logging.getLogger(__name__)
 
+print("DEBUG: Loading MVNESAgent from src/nes_copilot/agent_mvnes.py")
+
 class MVNESAgent:
     """
     Multivariate Normative Executive System (MVNES) Agent.
@@ -108,6 +110,7 @@ class MVNESAgent:
     def run_mvnes_trial(self, is_gain_frame: bool, time_constrained: bool,
                        valence_score_trial: float = 0.0, 
                        norm_category_for_trial: str = 'default') -> Tuple[int, float]:
+        print(">>>> MEGA DEBUG: AGENT MVNES RUN_MVNES_TRIAL BEING EXECUTED - VERSION FROM src/nes_copilot/agent_mvnes.py <<<<")
         """
         Run a single trial simulation with the MVNES model.
         

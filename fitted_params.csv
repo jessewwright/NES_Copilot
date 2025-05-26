@@ -1,0 +1,2 @@
+subject_id,v_norm,a_0,w_s_eff,t_0,alpha_gain,beta_val,logit_z0,log_tau_norm
+subj1,1.0,1.0,0.5,0.2,0.0,0.0,0.0,-0.693147

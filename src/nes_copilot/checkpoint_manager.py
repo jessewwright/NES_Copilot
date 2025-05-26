@@ -8,9 +8,15 @@ import os
 import json
 import torch
 import logging
+import sbi
+import numpy as np
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Union
 from datetime import datetime
+from sbi.inference import SNPE_C as SNPE
+from sbi.utils import BoxUniform, process_prior
+from sbi.utils.torchutils import atleast_2d_float32_tensor
+from torch.distributions import Distribution
 
 logger = logging.getLogger(__name__)
 
@@ -213,3 +219,123 @@ class CheckpointManager:
             'param_names': metadata['param_names'],
             'summary_stat_keys': metadata['summary_stat_keys']
         }
+        
+    def load_npe_posterior_object_from_checkpoint(
+        self,
+        checkpoint_dir: Union[str, Path],
+        device: str = 'cpu',
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Load a trained NPE (Neural Posterior Estimation) model from a checkpoint directory.
+        
+        This function loads the necessary components to perform inference with a trained
+        NPE model, including the posterior distribution, prior, and metadata.
+        
+        Args:
+            checkpoint_dir: Path to the directory containing the checkpoint files.
+            device: Device to load the model onto ('cpu' or 'cuda').
+            **kwargs: Additional arguments to pass to the posterior's `set_default_x` method.
+            
+        Returns:
+            A dictionary containing:
+                - 'posterior': The loaded NPE posterior object
+                - 'prior': The prior distribution
+                - 'metadata': Dictionary of metadata from training
+                - 'param_names': List of parameter names
+                - 'summary_stat_keys': List of summary statistic keys
+                
+        Raises:
+            FileNotFoundError: If required checkpoint files are missing
+            RuntimeError: If there's an error loading the model
+        """
+        logger.info(f"Loading NPE posterior from checkpoint: {checkpoint_dir}")
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        # Check if checkpoint directory exists
+        if not checkpoint_dir.exists():
+            raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+            
+        # Load metadata
+        metadata_path = checkpoint_dir / 'metadata.json'
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+            
+        try:
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+                
+            logger.info(f"Loaded metadata from {metadata_path}")
+            
+            # Extract parameter information
+            param_names = metadata.get('param_names', [f'param_{i}' for i in range(len(metadata['prior_low']))])
+            prior_low = torch.tensor(metadata['prior_low'], dtype=torch.float32, device=device)
+            prior_high = torch.tensor(metadata['prior_high'], dtype=torch.float32, device=device)
+            
+            # Create prior distribution
+            prior = BoxUniform(low=prior_low, high=prior_high, device=device)
+            logger.info(f"Created prior with bounds: {prior_low} to {prior_high}")
+            
+            # Load density estimator state dict
+            density_estimator_path = checkpoint_dir / 'density_estimator.pt'
+            if not density_estimator_path.exists():
+                # Try alternative naming convention
+                density_estimator_path = next(checkpoint_dir.glob('*density_estimator*.pt'), None)
+                if density_estimator_path is None:
+                    raise FileNotFoundError(
+                        f"Density estimator file not found in {checkpoint_dir}. "
+                        "Expected a file named 'density_estimator.pt' or similar."
+                    )
+            
+            # Initialize SNPE
+            logger.info("Initializing SNPE with prior...")
+            snpe = SNPE(prior=prior, device=device)
+            
+            # Load state dict
+            logger.info(f"Loading density estimator from {density_estimator_path}")
+            state_dict = torch.load(density_estimator_path, map_location=device)
+            
+            # Build posterior
+            logger.info("Building posterior...")
+            posterior = snpe.build_posterior(
+                prior=prior,
+                sample_with_mcmc=kwargs.pop('sample_with_mcmc', False),
+                mcmc_method=kwargs.pop('mcmc_method', 'slice_np'),
+                mcmc_parameters=kwargs.pop('mcmc_parameters', {})
+            )
+            
+            # Load state dict into the posterior's neural network
+            if hasattr(posterior, 'net'):
+                posterior.net.load_state_dict(state_dict)
+                posterior.net.to(device)
+            elif hasattr(posterior, '_posterior'):
+                # Handle different sbi versions
+                if hasattr(posterior._posterior, 'net'):
+                    posterior._posterior.net.load_state_dict(state_dict)
+                    posterior._posterior.net.to(device)
+                else:
+                    # Try direct loading for older sbi versions
+                    posterior.load_state_dict(state_dict)
+            else:
+                # Last resort: try direct loading
+                posterior.load_state_dict(state_dict)
+            
+            # Set device for the posterior
+            if hasattr(posterior, 'set_default_x'):
+                posterior.set_default_x(None, **kwargs)
+            
+            logger.info("Successfully loaded NPE posterior")
+            
+            # Return all relevant components
+            return {
+                'posterior': posterior,
+                'prior': prior,
+                'metadata': metadata,
+                'param_names': param_names,
+                'summary_stat_keys': metadata.get('summary_stat_keys', [])
+            }
+            
+        except Exception as e:
+            error_msg = f"Error loading NPE posterior from {checkpoint_dir}: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            raise RuntimeError(error_msg) from e

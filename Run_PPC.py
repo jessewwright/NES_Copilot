@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+
+"""Run Posterior Predictive Checks (PPCs) for the 6-parameter NES model.
+
+This script is designed for --empirical_fits_only mode, using mean fitted parameters
+to simulate data and compare with observed summary statistics.
+"""
+from __future__ import annotations
+
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE" # For specific matplotlib/torch issues
+import sys
+from datetime import datetime
+import argparse
+import json
+import logging
+import random
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import torch
+# from sbi.inference.posteriors import DirectPosterior as Posterior # Not used in empirical_fits_only
+from tqdm import tqdm
+
+# Define the 6 parameters used in the NES model (match fitted_params_file)
+PARAM_NAMES_FITTED = ['v_norm_mean', 'a_0_mean', 'w_s_eff_mean', 't_0_mean', 'alpha_gain_mean', 'beta_val_mean']
+# Corresponding agent parameter names if different (agent uses these for its attributes/config)
+PARAM_MAP_AGENT = {
+    'v_norm_mean': 'w_n',       # Norm weight in agent
+    'a_0_mean': 'threshold_a',  # Base threshold in agent
+    'w_s_eff_mean': 'w_s',      # Salience weight in agent
+    't_0_mean': 't',            # Non-decision time in agent
+    'alpha_gain_mean': 'alpha_gain',
+    'beta_val_mean': 'beta_val'
+}
+
+
+# --- Local project imports ---
+PROJECT_ROOT = Path(__file__).resolve().parent
+SRC_DIR = PROJECT_ROOT / "src"  # SRC_DIR is 'C:\Users\jesse\Hegemonikon Project\NES_Copilot\src'
+
+if not SRC_DIR.is_dir():
+    # This part is less likely to be hit now we know the structure
+    logging.error(f"CRITICAL: src/ directory not found at {SRC_DIR}. Cannot proceed.")
+    sys.exit(1)  # Exit if src isn't there
+else:
+    # src directory exists, add it to path to make 'nes_copilot' package findable
+    if str(SRC_DIR) not in sys.path:
+        sys.path.insert(0, str(SRC_DIR))
+    print(f"DEBUG SCRIPT: Added {SRC_DIR} to sys.path.")
+    print(f"DEBUG SCRIPT: Attempting to import from package 'nes_copilot' within {SRC_DIR}")
+    
+    try:
+        # Import using the package structure nes_copilot.module_name
+        from nes_copilot.agent_mvnes import MVNESAgent
+        from nes_copilot.roberts_stats import (
+            ROBERTS_SUMMARY_STAT_KEYS,
+            calculate_summary_stats_roberts as calculate_summary_stats
+        )
+        # You might also need this if it's used and in that folder:
+        # from nes_copilot.config_manager_fixed import FixedConfigManager as ConfigManager
+
+        print("DEBUG SCRIPT: Successfully imported modules from 'nes_copilot' package within src/.")
+    except ImportError as e:
+        logging.error(f"Failed to import from nes_copilot package: {e}")
+        logging.error(f"Current sys.path: {sys.path}")
+        logging.error(f"Contents of {SRC_DIR}: {[f.name for f in SRC_DIR.iterdir() if f.is_file() or f.is_dir()]}")
+        raise
+
+# Verify imports (optional but good)
+if 'MVNESAgent' not in locals():
+    raise ImportError("MVNESAgent failed to import.")
+if 'ROBERTS_SUMMARY_STAT_KEYS' not in locals():
+    raise ImportError("ROBERTS_SUMMARY_STAT_KEYS failed to import.")
+if 'calculate_summary_stats' not in locals():
+    raise ImportError("calculate_summary_stats failed to import.")
+# --- End Local project imports ---
+
+# --------------------------------------------------------------------------------------
+# Utility functions
+# --------------------------------------------------------------------------------------
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        prog="run_ppc",
+        description="Posterior Predictive Checks for the NES model using empirical fits.",
+    )
+    parser.add_argument("--fitted_params_file", type=Path, required=True, help="CSV with empirical posterior summaries (mean values).")
+    parser.add_argument("--roberts_data_file", type=Path, required=True, help="Raw Roberts data CSV (trial-level).")
+    parser.add_argument("--output_dir", type=Path, default=Path("ppc_outputs"), help="Output directory for PPC results.")
+    parser.add_argument("--subject_ids", type=str, default=None, help="Comma-separated subject IDs to analyse (default: all).")
+    parser.add_argument("--n_sim_reps", type=int, default=100, help="Number of simulation replicates per subject for PPC.")
+    parser.add_argument("--seed", type=int, default=42, help="RNG seed (torch & numpy).")
+    parser.add_argument("--threshold_scale", type=float, default=1.0, help="Scaling factor for the threshold parameter (a_0).")
+    parser.add_argument("--ppc_version", type=str, default="empirical_ppc", help="Version identifier for output directory.")
+    parser.add_argument("--force_cpu", action="store_true", help="Force CPU usage (relevant if torch operations were on GPU).")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    # --empirical_fits_only is assumed for this version of the script.
+    # --npe_file, num_posterior_draws, num_simulations_per_draw are omitted as they relate to NPE-based PPCs.
+    return parser.parse_args(argv)
+
+def setup_logging(debug: bool = False) -> None:
+    """Configure root logger for console output."""
+    log_level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='[%(levelname)s] %(asctime)s %(name)s - %(message)s',
+        datefmt='%H:%M:%S',
+        stream=sys.stderr
+    )
+    logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING) # Quieten matplotlib
+    logging.info(f"Logging level set to {logging.getLevelName(log_level)}")
+
+
+def get_trial_structure(df_subj_cleaned: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Converts a preprocessed and cleaned subject DataFrame to a list of trial dictionaries.
+    Assumes df_subj_cleaned already contains all necessary columns with correct types.
+    """
+    required_cols = [
+        'prob', 'is_gain_frame', 'frame', 'cond', 
+        'time_constrained', 'valence_score', 'norm_category_for_trial'
+    ]
+    missing = [col for col in required_cols if col not in df_subj_cleaned.columns]
+    if missing:
+        raise ValueError(
+            f"Cleaned DataFrame for get_trial_structure is missing columns: {missing}. "
+            f"Available columns: {df_subj_cleaned.columns.tolist()}"
+        )
+    
+    # Ensure correct types before converting to dicts
+    df_copy = df_subj_cleaned[required_cols].copy()
+    df_copy['prob'] = pd.to_numeric(df_copy['prob'], errors='coerce')
+    df_copy['valence_score'] = pd.to_numeric(df_copy['valence_score'], errors='coerce')
+    df_copy['is_gain_frame'] = df_copy['is_gain_frame'].astype(bool)
+    df_copy['time_constrained'] = df_copy['time_constrained'].astype(bool)
+    
+    # Fill any NaNs that might have been introduced by coerce, though data should be clean by now
+    if df_copy['prob'].isnull().any():
+        logging.warning("NaNs found in 'prob' column within get_trial_structure; filling with mean.")
+        df_copy['prob'].fillna(df_copy['prob'].mean(), inplace=True)
+    if df_copy['valence_score'].isnull().any():
+        logging.warning("NaNs found in 'valence_score' column within get_trial_structure; filling with 0.")
+        df_copy['valence_score'].fillna(0.0, inplace=True)
+
+    return df_copy.to_dict('records')
+
+
+def simulate_one_full_dataset(
+    agent: MVNESAgent,                  # Agent instance with its parameters already set
+    trial_struct: Sequence[Dict],
+    sim_control_params: Dict[str, Any]  # For dt, noise_std_dev, max_time (trial-specific)
+) -> Dict[str, Any] | None:
+    """
+    Run MVNESAgent across a subject's trial structure and compute summary stats.
+    The agent uses its own internal parameters (self.w_s, self.threshold_a, etc.).
+    The 'sim_control_params' are passed to the agent's run_mvnes_trial 'params' argument.
+    """
+    simulated_rows = []
+    if not trial_struct:
+        logging.warning("Empty trial structure provided to simulate_one_full_dataset.")
+        return None
+
+    logging.debug(f"Simulating {len(trial_struct)} trials.")
+    logging.debug(f"Agent DDM params (from agent.config): w_s={agent.config.get('w_s'):.3f}, w_n={agent.config.get('w_n'):.3f}, threshold_a={agent.config.get('threshold_a'):.3f}, t={agent.config.get('t'):.3f}, alpha_gain={agent.config.get('alpha_gain'):.3f}, beta_val={agent.config.get('beta_val'):.3f}")
+
+    for i, trial_info in enumerate(trial_struct):
+        try:
+            prob = float(trial_info['prob'])
+            is_gain_frame = bool(trial_info['is_gain_frame'])
+            frame_str_val = str(trial_info['frame'])
+            cond_str_val = str(trial_info['cond'])
+            time_constrained = bool(trial_info['time_constrained'])
+            valence_score = float(trial_info['valence_score'])
+            norm_category_str = str(trial_info['norm_category_for_trial'])
+
+            salience_input = prob
+            norm_input_val = 1.0 if is_gain_frame else -1.0 # Renamed to avoid clash
+
+            # Prepare the specific params dictionary for this trial for the agent
+            # This dict is passed to the 'params' argument of run_mvnes_trial
+            # It should contain simulation controls and any DDM params the agent expects in this dict
+            # As per agent_mvnes.py, it expects DDM params here too.
+            trial_specific_agent_params = sim_control_params.copy() # Start with base sim controls
+            trial_specific_agent_params['max_time'] = 3.0 if not time_constrained else 1.0
+            
+            # Add all agent DDM parameters to this dictionary from sim_control_params
+            trial_specific_agent_params.update({
+                # Core DDM parameters from sim_control_params
+                'w_s': sim_control_params.get('w_s'),
+                'w_n': sim_control_params.get('w_n'),
+                'threshold_a': sim_control_params.get('threshold_a'),
+                't': sim_control_params.get('t'),
+                'alpha_gain': sim_control_params.get('alpha_gain'),
+                'beta_val': sim_control_params.get('beta_val'),
+                
+                # Optional parameters with defaults
+                'logit_z0': sim_control_params.get('logit_z0', 0.0),
+                'log_tau_norm': sim_control_params.get('log_tau_norm', -0.693147),  # log(0.5)
+                'meta_cognitive_on': sim_control_params.get('meta_cognitive_on', False),
+                
+                # Ensure simulation control parameters are included
+                'noise_std_dev': sim_control_params.get('noise_std_dev', 1.0),
+                'dt': sim_control_params.get('dt', 0.01)
+            })
+            
+            category_mapping = {'default': 0, 'fairness': 1, 'altruism': 2, 'reciprocity': 3, 'trust': 4, 'cooperation': 5}
+            norm_category_code = category_mapping.get(norm_category_str.lower(), 0)
+
+            if i < 1: # Log first trial details extensively
+                logging.debug(f"  Trial {i}: salience_input={salience_input:.2f}, norm_input_val={norm_input_val:.2f}, valence_score={valence_score:.2f}, norm_category_code={norm_category_code}")
+                logging.debug(f"  Agent call params dict for trial {i}: {trial_specific_agent_params}")
+
+            trial_output = agent.run_mvnes_trial(
+                salience_input,                     # For agent's 'salience_input'
+                norm_input_val,                     # For agent's 'norm_input'
+                trial_specific_agent_params,         # For agent's 'params' (this is the dict)
+                valence_score_trial=valence_score,  # Explicit keyword
+                norm_category_for_trial=norm_category_code # Explicit keyword
+            )
+
+            simulated_rows.append({
+                'trial': i + 1, 'prob': prob, 'frame': frame_str_val, 'cond': cond_str_val,
+                'rt': trial_output.get('rt', np.nan), 'choice': trial_output.get('choice', 0)
+            })
+        except Exception as e:
+            logging.error(f"Error in simulate_one_full_dataset trial {i}: {e}", exc_info=True)
+            logging.error(f"Problematic trial_info: {trial_info}")
+            # To avoid cascading errors, re-raise if critical, or return None/partial
+            # For PPC, it's often better to get partial data than none.
+            # However, if it's a systematic error, it should be fixed.
+            # For now, let's allow it to skip problematic trials within a simulation.
+            continue 
+            
+    if not simulated_rows:
+        logging.warning("No rows were successfully simulated.")
+        return None
+        
+    df_sim = pd.DataFrame(simulated_rows)
+    try:
+        stats_dict = calculate_summary_stats(df_sim, ROBERTS_SUMMARY_STAT_KEYS)
+        return stats_dict
+    except Exception as e:
+        logging.error(f"Error calculating summary stats for simulated data: {e}", exc_info=True)
+        return None
+
+
+def simulate_n_replicates(
+    agent: MVNESAgent,
+    trial_struct: Sequence[Dict],
+    base_sim_control_params: Dict[str, Any], # e.g. dt, noise_std_dev
+    n_reps: int
+) -> List[Dict[str, Any]]:
+    """Run multiple simulations with the same agent (and its set parameters)."""
+    all_replicate_stats = []
+    for _ in tqdm(range(n_reps), desc="Simulating replicates", leave=False):
+        stats = simulate_one_full_dataset(agent, trial_struct, base_sim_control_params)
+        if stats:
+            all_replicate_stats.append(stats)
+    return all_replicate_stats
+
+
+def plot_ppc_distributions(
+    ppc_results: Dict[str, Any], 
+    output_dir: Path,
+    subject_ids_to_plot: Optional[List[str]] = None,
+    stats_to_plot: Optional[List[str]] = None
+) -> None:
+    """Generate PPC plots for each subject and summary statistic."""
+    if subject_ids_to_plot is None:
+        subject_ids_to_plot = list(ppc_results.keys())
+    
+    default_stats = [
+        'prop_gamble_overall', 'mean_rt_overall', 'framing_effect_ntc', 
+        'framing_effect_tc', 'rt_std_overall'
+    ]
+    stats_to_plot = stats_to_plot if stats_to_plot is not None else default_stats
+    
+    plot_dir = output_dir / 'plots'
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    
+    for subj_id in tqdm(subject_ids_to_plot, desc="Generating PPC plots"):
+        if subj_id not in ppc_results:
+            logging.warning(f"No PPC results found for subject {subj_id} to plot.")
+            continue
+            
+        subj_data = ppc_results[subj_id]
+        obs_stats = subj_data.get('observed_summary_stats')
+        sim_stats_list = subj_data.get('simulated_summary_stats_list')
+        
+        if not obs_stats or not sim_stats_list:
+            logging.warning(f"Missing observed or simulated stats for subject {subj_id}.")
+            continue
+            
+        for stat_key in stats_to_plot:
+            if stat_key not in obs_stats:
+                logging.debug(f"Statistic '{stat_key}' not in observed_stats for subject {subj_id}.")
+                continue
+            
+            obs_val = obs_stats[stat_key]
+            sim_vals_for_stat = [s.get(stat_key) for s in sim_stats_list if s and stat_key in s]
+            sim_vals_for_stat = [s for s in sim_vals_for_stat if pd.notna(s)]
+
+            if not sim_vals_for_stat:
+                logging.debug(f"No valid simulated values for stat '{stat_key}' for subject {subj_id}.")
+                continue
+            
+            try:
+                plt.figure(figsize=(10, 6))
+                sns.histplot(sim_vals_for_stat, kde=True, stat='density', color='skyblue', edgecolor='white', bins=min(30, max(5, len(sim_vals_for_stat)//10)))
+                plt.axvline(obs_val, color='red', linestyle='--', linewidth=2, label=f'Observed: {obs_val:.3f}')
+                
+                lower_ci = np.percentile(sim_vals_for_stat, 2.5)
+                upper_ci = np.percentile(sim_vals_for_stat, 97.5)
+                plt.axvspan(lower_ci, upper_ci, alpha=0.2, color='gray', label=f'95% CI [{lower_ci:.3f}, {upper_ci:.3f}]')
+                
+                plt.title(f'Subject {subj_id} - {stat_key}')
+                plt.xlabel('Statistic Value')
+                plt.ylabel('Density')
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(plot_dir / f"subj_{subj_id}_{stat_key}.png")
+                plt.close()
+            except Exception as e:
+                logging.warning(f"Error plotting {stat_key} for subject {subj_id}: {e}")
+                plt.close('all')
+
+
+def calculate_detailed_coverage(ppc_results: Dict[str, Any]) -> pd.DataFrame:
+    """Calculate detailed coverage statistics for each subject and statistic."""
+    rows = []
+    for subj_id, data in ppc_results.items():
+        obs_stats = data.get('observed_summary_stats')
+        sim_stats_list = data.get('simulated_summary_stats_list')
+        
+        if not obs_stats or not sim_stats_list:
+            continue
+            
+        for stat_key, obs_val in obs_stats.items():
+            if pd.isna(obs_val): continue
+
+            sim_vals_for_stat = [s.get(stat_key) for s in sim_stats_list if s and stat_key in s]
+            sim_vals_for_stat = [s for s in sim_vals_for_stat if pd.notna(s)]
+
+            if not sim_vals_for_stat: continue
+            
+            sim_mean = np.mean(sim_vals_for_stat)
+            sim_std = np.std(sim_vals_for_stat, ddof=1)
+            ci_95_lower = np.percentile(sim_vals_for_stat, 2.5)
+            ci_95_upper = np.percentile(sim_vals_for_stat, 97.5)
+            covered_95 = int(ci_95_lower <= obs_val <= ci_95_upper)
+            
+            rows.append({
+                'subject_id': subj_id, 'stat_key': stat_key, 'observed': obs_val,
+                'simulated_mean': sim_mean, 'simulated_std': sim_std,
+                'covered_95': covered_95, 'ci_95_lower': ci_95_lower, 'ci_95_upper': ci_95_upper,
+                'n_simulations_for_stat': len(sim_vals_for_stat)
+            })
+            
+    if not rows:
+        logging.warning("No data for coverage calculation.")
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Main entry point for running PPCs."""
+    args = parse_args(argv)
+    setup_logging(debug=args.debug)
+    
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    args.output_dir = Path(str(args.output_dir) + f'_{args.ppc_version}')
+    logging.info(f"Run mode: Empirical Fits Only. Output will be saved to: {args.output_dir}")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    with open(args.output_dir / 'run_config.json', 'w') as f:
+        json.dump(vars(args), f, indent=2, default=str)
+
+    # Load empirical fits
+    logging.info(f"Loading empirical fits from {args.fitted_params_file}")
+    df_fits = pd.read_csv(args.fitted_params_file)
+    if 'subject' not in df_fits.columns and 'subject_id' in df_fits.columns:
+        df_fits.rename(columns={'subject_id': 'subject'}, inplace=True)
+    df_fits['subject'] = df_fits['subject'].astype(str).str.strip()
+    logging.info(f"Loaded {len(df_fits)} subjects' fitted parameters.")
+
+    # Load and preprocess empirical behavioral data
+    if not args.roberts_data_file or not args.roberts_data_file.exists():
+        raise FileNotFoundError(f"Roberts data file not found: {args.roberts_data_file}")
+    logging.info(f"Loading Roberts behavioral data from {args.roberts_data_file}")
+    df_raw_empirical = pd.read_csv(args.roberts_data_file)
+    df_raw_empirical.columns = [col.lower().replace(' ', '_') for col in df_raw_empirical.columns]
+    
+    # Basic preprocessing specific to Roberts data
+    df_empirical_processed = df_raw_empirical[df_raw_empirical['trialtype'].str.lower() == 'target'].copy()
+    df_empirical_processed['subject'] = df_empirical_processed['subject'].astype(str).str.strip()
+    df_empirical_processed['choice'] = pd.to_numeric(df_empirical_processed['choice'], errors='coerce').fillna(0).astype(int)
+    df_empirical_processed['rt'] = pd.to_numeric(df_empirical_processed['rt'], errors='coerce')
+    df_empirical_processed['prob'] = pd.to_numeric(df_empirical_processed['prob'], errors='coerce')
+    df_empirical_processed['is_gain_frame'] = df_empirical_processed['frame'].str.lower() == 'gain'
+    df_empirical_processed['time_constrained'] = df_empirical_processed['cond'].str.lower() == 'tc'
+    if 'valence_score' not in df_empirical_processed.columns: # Add if missing
+        df_empirical_processed['valence_score'] = 0.0 
+    if 'norm_category_for_trial' not in df_empirical_processed.columns:
+        df_empirical_processed['norm_category_for_trial'] = 'default'
+    
+    all_empirical_subjects = sorted(df_empirical_processed['subject'].unique())
+    fitted_subjects = set(df_fits['subject'].unique())
+    
+    subjects_to_run = sorted(list(set(all_empirical_subjects) & fitted_subjects))
+    if args.subject_ids:
+        requested_subjects = {s.strip() for s in args.subject_ids.split(",")}
+        subjects_to_run = sorted(list(requested_subjects.intersection(subjects_to_run)))
+        missing_ids = requested_subjects - set(subjects_to_run)
+        if missing_ids:
+            logging.warning(f"Requested subject IDs not found or missing fits/data: {missing_ids}")
+
+    if not subjects_to_run:
+        raise ValueError("No valid subjects to process with both data and fits.")
+    logging.info(f"Processing {len(subjects_to_run)} subjects: {subjects_to_run[:5]}...")
+
+    ppc_results: Dict[str, Any] = {}
+    processed_count = 0  # Initialize counter for successfully processed subjects
+    
+    for subj_id in tqdm(subjects_to_run, desc="Processing subjects"):
+        logging.info(f"--- Subject {subj_id} ---")
+        
+        # Get subject's empirical parameters
+        subj_fits_row = df_fits[df_fits['subject'] == subj_id].iloc[0]
+        
+        # Prepare parameters for the agent and simulation functions
+        # This dict is passed to simulate_n_replicates -> simulate_one_full_dataset
+        # simulate_one_full_dataset then constructs the 'params' dict for agent.run_mvnes_trial
+        current_subject_params_for_sim_func = {}
+        for fit_param_name, agent_param_name in PARAM_MAP_AGENT.items():
+            current_subject_params_for_sim_func[agent_param_name] = float(subj_fits_row[fit_param_name])
+        
+        # Apply threshold scaling
+        current_subject_params_for_sim_func['threshold_a'] *= args.threshold_scale
+        
+        # Add fixed/default parameters expected by simulate_one_full_dataset's 'params' argument
+        # which are then used to build the dict for agent.run_mvnes_trial
+        current_subject_params_for_sim_func.update({
+            'logit_z0': 0.0,
+            'log_tau_norm': -0.693147, # log(0.5)
+            'meta_cognitive_on': False,
+            'noise_std_dev': 1.0, # Default simulation noise, can be in agent_config
+            'dt': 0.01           # Default simulation dt
+        })
+        logging.debug(f"Parameters for simulate_n_replicates for subj {subj_id}: {current_subject_params_for_sim_func}")
+
+        # Initialize agent and set its DDM attributes from the subject's fitted params
+        # The agent's run_mvnes_trial will use these attributes via params.get('attr', self.config.get('attr'))
+        # if the key isn't found in the dict passed to its 'params' argument.
+        # OR, if the agent's run_mvnes_trial is written to directly use self.w_s etc.
+        # Our current agent_mvnes.py's run_mvnes_trial uses the passed 'params' dict primarily.
+        agent = MVNESAgent() # Uses its own defaults initially
+        # Override agent's internal parameters with subject-specific ones
+        # These will be accessed by agent.run_mvnes_trial via params.get(..., self.config.get(..., default_agent_val))
+        # Effectively, the dict passed to agent.run_mvnes_trial will contain these.
+        for agent_key, value in current_subject_params_for_sim_func.items():
+            if hasattr(agent, agent_key): # Primarily for DDM parameters like w_s, w_n, etc.
+                setattr(agent, agent_key, value)
+            # Also ensure agent.config has them if agent uses self.config.get() as fallback
+            agent.config[agent_key] = value
+
+
+        # Prepare subject's empirical trial data
+        df_subj_empirical = df_empirical_processed[df_empirical_processed['subject'] == subj_id].copy()
+        if df_subj_empirical.empty:
+            logging.warning(f"No empirical trial data for subject {subj_id}. Skipping.")
+            continue
+        
+        # Clean and prepare trial_data for get_trial_structure & observed stats
+        # Handle NaNs more carefully, e.g., for RT before get_trial_structure
+        if df_subj_empirical['rt'].isnull().any():
+            rt_mean = df_subj_empirical['rt'].mean()
+            df_subj_empirical['rt'].fillna(rt_mean, inplace=True)
+            logging.warning(f"Filled {df_subj_empirical['rt'].isnull().sum()} NaN RTs with mean {rt_mean} for subject {subj_id}")
+        
+        # Drop rows if critical columns (prob, choice) are NaN AFTER attempting to fill RT
+        df_subj_empirical.dropna(subset=['prob', 'choice', 'rt'], inplace=True)
+        if df_subj_empirical.empty:
+            logging.warning(f"No valid trials after NaN drop for subject {subj_id}. Skipping.")
+            continue
+
+        try:
+            trial_struct = get_trial_structure(df_subj_empirical)
+            observed_summary_stats = calculate_summary_stats(df_subj_empirical, ROBERTS_SUMMARY_STAT_KEYS)
+        except Exception as e:
+            logging.error(f"Error preparing data or obs stats for subject {subj_id}: {e}", exc_info=True)
+            continue
+            
+        if not trial_struct:
+            logging.warning(f"Empty trial_struct for subject {subj_id}. Skipping.")
+            continue
+        if not observed_summary_stats:
+            logging.warning(f"Could not compute observed_summary_stats for subject {subj_id}. Skipping.")
+            continue
+        
+        logging.info(f"Running {args.n_sim_reps} simulation replicates for subject {subj_id}.")
+        
+        # Base simulation control parameters (dt, noise) are already in current_subject_params_for_sim_func
+        # which is passed to simulate_n_replicates, then to simulate_one_full_dataset,
+        # and then used to construct the 'params' dict for agent.run_mvnes_trial.
+        simulated_stats_list = simulate_n_replicates(
+            agent=agent, # Agent now has subject-specific DDM params set as attributes
+            trial_struct=trial_struct,
+            base_sim_control_params=current_subject_params_for_sim_func, # This dict contains all needed params
+            n_reps=args.n_sim_reps
+        )
+        
+        if not simulated_stats_list:
+            logging.warning(f"No valid simulation results for subject {subj_id}.")
+            continue
+            
+        ppc_results[subj_id] = {
+            'observed_summary_stats': observed_summary_stats,
+            'simulated_summary_stats_list': simulated_stats_list,
+            'params_used_for_agent_attributes': {k: getattr(agent, k) for k in PARAM_MAP_AGENT.values() if hasattr(agent, k)},
+            'params_passed_to_sim_func': current_subject_params_for_sim_func
+        }
+        processed_count +=1
+        pbar.update(1)
+
+    logging.info(f"Successfully processed {processed_count}/{len(subjects_to_run)} subjects.")
+
+    if not ppc_results:
+        logging.warning("No subjects were successfully processed. Exiting.")
+        return
+
+    output_file = args.output_dir / 'ppc_results.json'
+    with open(output_file, 'w') as f:
+        json.dump(ppc_results, f, indent=2)
+    logging.info(f"Saved PPC results to {output_file}")
+    
+    plot_ppc_distributions(ppc_results, args.output_dir, subjects_to_run)
+    
+    coverage_df = calculate_detailed_coverage(ppc_results)
+    if not coverage_df.empty:
+        coverage_file = args.output_dir / 'coverage_statistics.csv'
+        coverage_df.to_csv(coverage_file, index=False)
+        logging.info(f"Saved coverage statistics to {coverage_file}")
+        
+        # Print summary (example)
+        if 'covered_95' in coverage_df.columns:
+            avg_coverage = coverage_df.groupby('stat_key')['covered_95'].mean()
+            logging.info("\nAverage 95% Coverage Per Statistic:\n" + avg_coverage.to_string())
+    else:
+        logging.info("No coverage data to save or display.")
+
+    logging.info("PPC script finished.")
+
+
+if __name__ == "__main__":
+    main()

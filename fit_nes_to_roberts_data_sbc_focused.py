@@ -33,8 +33,25 @@ import torch.nn as nn
 import sbi.utils as sbi_utils
 from sbi import utils as sbi_utils_module
 from sbi.utils.user_input_checks import process_prior
-from sbi.neural_nets.embedding_nets import FCEmbedding
-from sbi.neural_nets import posterior_nn
+# Import FCEmbedding with fallback for different sbi versions
+try:
+    from sbi.neural_nets.embedding_nets import FCEmbedding
+except ImportError:
+    # Fallback for newer sbi versions
+    from sbi.utils.torchutils import create_alternating_binary_mask
+    from sbi.neural_nets.mlp import MLP
+    
+    class FCEmbedding(MLP):
+        """A simple MLP for embedding summary statistics."""
+        def __init__(self, input_dim, output_dim, hidden_dims=(50, 50), **kwargs):
+            super().__init__(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                hidden_dims=hidden_dims,
+                **kwargs
+            )
+
+# Remove problematic posterior_nn import and use direct imports instead
 
 # --- SBI Imports ---
 try:
@@ -48,7 +65,7 @@ except ImportError as e:
 
 # Import the 25-stat version from stats_schema
 try:
-    from src.nes_copilot.stats_schema import NES_SUMMARY_STAT_KEYS
+    from src.nes_copilot.stats_schema import ROBERTS_SUMMARY_STAT_KEYS as NES_SUMMARY_STAT_KEYS
     print(f"Successfully imported {len(NES_SUMMARY_STAT_KEYS)} summary statistics from stats_schema")
 except ImportError as e:
     print(f"Error importing stats_schema: {e}")
@@ -199,13 +216,28 @@ sbi_logger.setLevel(logging.WARNING)
 
 PARAM_NAMES = ['v_norm', 'a_0', 'w_s_eff', 't_0', 'alpha_gain', 'beta_val']  # 6 parameters
 
-# Wide priors (original)
-PRIOR_LOW_WIDE = torch.tensor([0.1, 0.5, 0.2, 0.05, 0.5, -1.0])
-PRIOR_HIGH_WIDE = torch.tensor([2.0, 2.5, 1.5, 0.7, 1.0, 1.0])
+# Hybrid priors - Wider for v_norm, alpha_gain, beta_val; Tight for a_0, w_s_eff, t_0
+# PARAM_NAMES = ['v_norm', 'a_0', 'w_s_eff', 't_0', 'alpha_gain', 'beta_val']
+PRIOR_LOW_WIDE = torch.tensor([
+    0.1,    # v_norm (WIDER: was 0.3)
+    0.8,    # a_0 (TIGHT: keep)
+    0.3,    # w_s_eff (TIGHT: keep)
+    0.10,   # t_0 (TIGHT: keep)
+    0.5,    # alpha_gain (WIDER: was 0.6 or 0.5, new high is 1.0)
+    -1.0    # beta_val (WIDER: was -0.5 or -0.6)
+])
+PRIOR_HIGH_WIDE = torch.tensor([
+    2.0,    # v_norm (WIDER: was 1.0 or 1.5)
+    1.8,    # a_0 (TIGHT: keep)
+    1.2,    # w_s_eff (TIGHT: keep)
+    0.50,   # t_0 (TIGHT: keep)
+    1.0,    # alpha_gain (WIDER: was 0.9 or 1.0)
+    1.0     # beta_val (WIDER: was 0.5 or 0.6)
+])
 
-# Tight priors (advisor's suggestion)
-PRIOR_LOW_TIGHT = torch.tensor([0.3, 1.0, 0.5, 0.1, 0.6, -0.5])
-PRIOR_HIGH_TIGHT = torch.tensor([1.0, 2.0, 1.2, 0.5, 0.9, 0.5])
+# For compatibility with --use_tight_priors flag (will use the same as wide since we're hard-coding hybrid)
+PRIOR_LOW_TIGHT = PRIOR_LOW_WIDE
+PRIOR_HIGH_TIGHT = PRIOR_HIGH_WIDE
 
 # Default to wide priors (will be set in main based on args)
 PRIOR_LOW = PRIOR_LOW_WIDE
@@ -1044,8 +1076,18 @@ def main():
     torch.manual_seed(args.seed)
     
     # Set device (GPU/CPU)
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.force_cpu else "cpu")
+    if args.force_cpu or not torch.cuda.is_available():
+        device = 'cpu'
+    else:
+        device = 'cuda'
     logging.info(f"Using device: {device}. Seed: {args.seed}")
+    
+    # Set device for torch
+    torch.set_default_tensor_type('torch.FloatTensor')  # Default to CPU tensors
+    if device == 'cuda':
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
+        
+    logging.info("Using HYBRID priors: Wider for v_norm, alpha_gain, beta_val; Tight for a_0, w_s_eff, t_0")
     
     # Set priors based on command line argument
     global PRIOR_LOW, PRIOR_HIGH
@@ -1070,7 +1112,25 @@ def main():
     except Exception as e_template:
         logging.error(f"Failed to prepare trial template: {e_template}", exc_info=True); sys.exit(1)
 
-    sbi_prior = BoxUniform(low=PRIOR_LOW.to(device), high=PRIOR_HIGH.to(device), device=device.type)
+    # Log the final priors being used
+    logging.info(f"FINAL PRIOR BEING USED - LOW: {PRIOR_LOW.tolist()}, HIGH: {PRIOR_HIGH.tolist()}")
+    
+    # For sbi 0.22.0, we need to handle CPU devices specially
+    if device == 'cpu':
+        # For CPU, we'll create the prior on CPU and let sbi handle the device
+        sbi_prior = BoxUniform(
+            low=PRIOR_LOW.cpu(),
+            high=PRIOR_HIGH.cpu(),
+            device=None  # Let sbi handle device
+        )
+    else:
+        # For CUDA, we can specify the device directly
+        torch_device = torch.device(device)
+        sbi_prior = BoxUniform(
+            low=PRIOR_LOW.to(torch_device),
+            high=PRIOR_HIGH.to(torch_device),
+            device=torch_device
+        )
     def actual_simulator_for_sbi(parameter_sample_batch_tensor: torch.Tensor) -> torch.Tensor:
         # This function is called by simulate_for_sbi.
         # parameter_sample_batch_tensor can be [batch_size, num_params] or [num_params]
@@ -1106,47 +1166,40 @@ def main():
 
     # Set up NPE with selected architecture
     if args.npe_architecture == 'nsf':
-        # Create embedding net with simpler architecture
-        # First check what parameters are accepted by FCEmbedding
-        logging.info("Creating embedding network...")
-        embedding_net = FCEmbedding(
-            input_dim=x_train_valid.shape[1],
-            num_layers=2,  # Two hidden layers
-            num_hiddens=256,  # 256 units per hidden layer
-            output_dim=30  # Reduce to 30 features
-        )
-        
-        # Create NSF density estimator
+        # For sbi 0.22.0
+        logging.info("Using NSF density estimator with 3 transforms and 60 hidden units")
+        from sbi.utils.get_nn_models import posterior_nn
         density_estimator = posterior_nn(
-            model='nsf',
-            embedding_net=embedding_net,
-            hidden_features=256,
-            num_transforms=8,
-            num_bins=8,
-            z_score_theta='independent',
-            z_score_x='independent'
-        )
-        
-        logging.info("Using NSF density estimator with embedding net (60 -> 30 features) and 8 transforms")
-        npe = SNPE(
-            prior=sbi_prior,
-            density_estimator=density_estimator,
-            device=device.type,
-            show_progress_bars=True
+            model="nsf",
+            hidden_features=60,
+            num_transforms=3
         )
     else:
         # Default to MAF
         logging.info("Using MAF density estimator (default)")
-        npe = SNPE(
-            prior=sbi_prior,
-            density_estimator='maf',
-            device=device.type
-        )
+        density_estimator = 'maf'
+    
+    # Initialize NPE
+    npe = SNPE(
+        prior=sbi_prior,
+        density_estimator=density_estimator,
+        device=device,
+        show_progress_bars=True
+    )
+    
+    # Append simulations
+    npe = npe.append_simulations(
+        theta=theta_train_valid,
+        x=x_train_valid
+    )
     
     # Train the density estimator
-    density_estimator = npe.append_simulations(theta_train_valid, x_train_valid).train(
-        show_train_summary=True,
-        force_first_round_loss=True
+    density_estimator = npe.train(
+        training_batch_size=min(100, len(theta_train_valid)),
+        learning_rate=5e-4,
+        validation_fraction=0.1,
+        stop_after_epochs=20,
+        show_train_summary=True
     )
 
     # --- Compute and save training summary-stat means and stds ---
@@ -1171,19 +1224,47 @@ def main():
 
     # --- Save all valid training data for reproducibility ---
     torch.save({'theta_train_valid': theta_train_valid.cpu(), 'x_train_valid': x_train_valid.cpu()}, output_dir_data / 'theta_x_train_valid.pt')
-    np.save(output_dir_data / 'x_train_valid.npy', x_train_valid.cpu().numpy())
-    np.save(output_dir_data / 'theta_train_valid.npy', theta_train_valid.cpu().numpy())
-    pd.DataFrame(x_train_valid.cpu().numpy()).to_csv(output_dir_data / 'simulated_summary_stats.csv', index=False, header=False)
+    
+    # Save numpy arrays
+    x_train_valid_np = x_train_valid.cpu().numpy()
+    theta_train_valid_np = theta_train_valid.cpu().numpy()
+    np.save(output_dir_data / 'x_train_valid.npy', x_train_valid_np)
+    np.save(output_dir_data / 'theta_train_valid.npy', theta_train_valid_np)
+    
+    # Define parameter names (adjust these based on your model's parameters)
+    parameter_names = [f'param_{i+1}' for i in range(theta_train_valid.shape[1])]  # Default names if not available
+    
+    # Create DataFrames with proper column names
+    df_stats = pd.DataFrame(x_train_valid_np, columns=summary_stat_keys)
+    df_params = pd.DataFrame(theta_train_valid_np, columns=parameter_names)
+    
+    # Combine parameters and stats into a single DataFrame
+    df_combined = pd.concat([df_params, df_stats], axis=1)
+    
+    # Save the combined DataFrame to CSV
+    df_combined.to_csv(output_dir_data / 'simulated_summary_stats.csv', index=False)
+    
+    # Also save stats and params separately for backward compatibility
+    df_stats.to_csv(output_dir_data / 'simulated_summary_stats_only.csv', index=False)
+    df_params.to_csv(output_dir_data / 'simulated_parameters.csv', index=False)
+    
+    # Save statistics about the training data
     training_stat_means = x_train_valid.mean(dim=0).cpu().numpy()
     training_stat_stds = x_train_valid.std(dim=0).cpu().numpy()
     np.save(output_dir_data / 'training_stat_means.npy', training_stat_means)
     np.save(output_dir_data / 'training_stat_stds.npy', training_stat_stds)
-    pd.DataFrame(training_stat_means).to_csv(output_dir_data / 'training_stat_means.csv', index=False, header=False)
-    pd.DataFrame(training_stat_stds).to_csv(output_dir_data / 'training_stat_stds.csv', index=False, header=False)
+    
+    # Save means and stds with proper column names
+    pd.DataFrame([training_stat_means], columns=summary_stat_keys).to_csv(
+        output_dir_data / 'training_stat_means.csv', index=False)
+    pd.DataFrame([training_stat_stds], columns=summary_stat_keys).to_csv(
+        output_dir_data / 'training_stat_stds.csv', index=False)
 
     # --- Save summary_stat_keys and parameter names ---
     with open(output_dir_data / 'summary_stat_keys.json', 'w') as f:
         json.dump(summary_stat_keys, f, indent=2)
+    with open(output_dir_data / 'parameter_names.json', 'w') as f:
+        json.dump(parameter_names, f, indent=2)
     with open(output_dir_data / 'parameter_names.json', 'w') as f:
         json.dump(PARAM_NAMES, f, indent=2)
 
