@@ -12,7 +12,8 @@ from typing import Dict, Any, List, Optional, Union, Tuple, Literal
 # Set up logging
 logger = logging.getLogger(__name__)
 
-print("DEBUG: Loading MVNESAgent from src/nes_copilot/agent_mvnes.py")
+# Debug logging is now handled through the logging module
+# logger.debug("Loading MVNESAgent from src/nes_copilot/agent_mvnes.py")
 
 class MVNESAgent:
     """
@@ -110,7 +111,8 @@ class MVNESAgent:
     def run_mvnes_trial(self, is_gain_frame: bool, time_constrained: bool,
                        valence_score_trial: float = 0.0, 
                        norm_category_for_trial: str = 'default') -> Tuple[int, float]:
-        print(">>>> MEGA DEBUG: AGENT MVNES RUN_MVNES_TRIAL BEING EXECUTED - VERSION FROM src/nes_copilot/agent_mvnes.py <<<<")
+        # Debug logging can be enabled by setting the appropriate log level
+        # logger.debug(f"Running MVNES trial: is_gain_frame={is_gain_frame}, time_constrained={time_constrained}")
         """
         Run a single trial simulation with the MVNES model.
         
@@ -134,7 +136,7 @@ class MVNESAgent:
         
         # Prepare parameters for the trial
         params = {
-            'w_s': self.config['w_s'],
+            'w_s': self.w_s_eff,  # Use the instance attribute directly
             'w_n': self.v_norm,  # Using v_norm as the weight for norm input
             'threshold_a': self.a_0,
             't': self.t_0,
@@ -153,7 +155,7 @@ class MVNESAgent:
             salience_input=salience_input,
             norm_input=norm_input,
             params=params,
-            valence_score_trial=valence_score_trial,
+            valence_score_trial=valence_score_trial,  # Pass the valence_score_trial parameter directly
             norm_category_for_trial=norm_category_for_trial
         )
         
@@ -198,6 +200,9 @@ class MVNESAgent:
             effective_threshold_a = base_threshold_a * (1.0 + alpha_gain_val)
         else:
             effective_threshold_a = base_threshold_a
+        
+        # Debug logging can be enabled by setting the appropriate log level
+        # logger.debug(f"_run_trial: valence_score_trial={valence_score_trial}, current_beta_val={current_beta_val}, current_logit_z0={current_logit_z0}")
         
         # Calculate starting point using valence bias
         logit_z_trial = current_logit_z0 + current_beta_val * valence_score_trial

@@ -57,6 +57,11 @@ data/raw/
 Roberts_Framing_Data/
 results/
 sbc_nes_6param_60SS_tightPrior_nsf_60k_TEST/
+ppc_results_v6param_empirical_beta/
+ppc_results_v6param_empirical_beta_100reps/
+ppc_results_v6param_empirical_beta_100reps_ALL/
+ppc_results_v6param_empirical_beta_200reps_ALL/
+waic_results/
 
 # Large files
 *.zip

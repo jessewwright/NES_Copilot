@@ -50,26 +50,31 @@ if not SRC_DIR.is_dir():
 else:
     # src directory exists, add it to path to make 'nes_copilot' package findable
     if str(SRC_DIR) not in sys.path:
+        # Debug prints for path resolution - commented out for cleaner output
+        # print(f"DEBUG SCRIPT: Added {SRC_DIR} to sys.path.")
+        # print(f"DEBUG SCRIPT: Attempting to import from package 'nes_copilot' within {SRC_DIR}")
         sys.path.insert(0, str(SRC_DIR))
-    print(f"DEBUG SCRIPT: Added {SRC_DIR} to sys.path.")
-    print(f"DEBUG SCRIPT: Attempting to import from package 'nes_copilot' within {SRC_DIR}")
-    
-    try:
-        # Import using the package structure nes_copilot.module_name
-        from nes_copilot.agent_mvnes import MVNESAgent
-        from nes_copilot.roberts_stats import (
-            ROBERTS_SUMMARY_STAT_KEYS,
-            calculate_summary_stats_roberts as calculate_summary_stats
-        )
-        # You might also need this if it's used and in that folder:
-        # from nes_copilot.config_manager_fixed import FixedConfigManager as ConfigManager
 
-        print("DEBUG SCRIPT: Successfully imported modules from 'nes_copilot' package within src/.")
-    except ImportError as e:
-        logging.error(f"Failed to import from nes_copilot package: {e}")
-        logging.error(f"Current sys.path: {sys.path}")
-        logging.error(f"Contents of {SRC_DIR}: {[f.name for f in SRC_DIR.iterdir() if f.is_file() or f.is_dir()]}")
-        raise
+try:
+    # Import using the package structure nes_copilot.module_name
+    from nes_copilot.agent_mvnes import MVNESAgent
+    from nes_copilot.roberts_stats import calculate_summary_stats_roberts as calculate_summary_stats, ROBERTS_SUMMARY_STAT_KEYS, validate_summary_stats
+    from nes_copilot.config_manager_fixed import FixedConfigManager as ConfigManager
+    # You might also need this if it's used and in that folder:
+    # from nes_copilot.config_manager_fixed import FixedConfigManager as ConfigManager
+
+    # Debug prints for imports - commented out for cleaner output
+    # print("DEBUG SCRIPT: Successfully imported modules from 'nes_copilot' package within src/.")
+    # print(f"DEBUG SCRIPT: Current working directory: {os.getcwd()}")
+    # print(f"DEBUG SCRIPT: Python path: {sys.path}")
+    # print(f"DEBUG SCRIPT: Attempting to import from 'nes_copilot'...")
+    pass
+
+except ImportError as e:
+    logging.error(f"Failed to import from nes_copilot package: {e}")
+    logging.error(f"Current sys.path: {sys.path}")
+    logging.error(f"Contents of {SRC_DIR}: {[f.name for f in SRC_DIR.iterdir() if f.is_file() or f.is_dir()]}")
+    raise
 
 # Verify imports (optional but good)
 if 'MVNESAgent' not in locals():
@@ -94,7 +99,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--roberts_data_file", type=Path, required=True, help="Raw Roberts data CSV (trial-level).")
     parser.add_argument("--output_dir", type=Path, default=Path("ppc_outputs"), help="Output directory for PPC results.")
     parser.add_argument("--subject_ids", type=str, default=None, help="Comma-separated subject IDs to analyse (default: all).")
-    parser.add_argument("--n_sim_reps", type=int, default=100, help="Number of simulation replicates per subject for PPC.")
+    parser.add_argument("--n_sim_reps", type=int, default=100, help="Number of simulation replicates FOR EACH pseudo-posterior parameter draw.")
+    parser.add_argument("--n_pseudo_posterior_samples", type=int, default=50, help="# of pseudo-posterior parameter sets to draw per subject. Set to 0 or 1 to use only mean parameters (with n_sim_reps).")
     parser.add_argument("--seed", type=int, default=42, help="RNG seed (torch & numpy).")
     parser.add_argument("--threshold_scale", type=float, default=1.0, help="Scaling factor for the threshold parameter (a_0).")
     parser.add_argument("--ppc_version", type=str, default="empirical_ppc", help="Version identifier for output directory.")
@@ -163,11 +169,12 @@ def simulate_one_full_dataset(
     """
     simulated_rows = []
     if not trial_struct:
-        logging.warning("Empty trial structure provided to simulate_one_full_dataset.")
-        return None
-
-    logging.debug(f"Simulating {len(trial_struct)} trials.")
-    logging.debug(f"Agent DDM params (from agent.config): w_s={agent.config.get('w_s'):.3f}, w_n={agent.config.get('w_n'):.3f}, threshold_a={agent.config.get('threshold_a'):.3f}, t={agent.config.get('t'):.3f}, alpha_gain={agent.config.get('alpha_gain'):.3f}, beta_val={agent.config.get('beta_val'):.3f}")
+        # Detailed debug logging - uncomment only when needed
+        # logging.debug("Simulate_one_full_dataset received parameters:")
+        # for param_name_key, value in params.items():
+        #     logging.debug(f"  {param_name_key}: {value}")
+        logging.info(f"Simulating {len(trial_struct)} trials.")
+        # logging.debug(f"Agent DDM params (from agent.config): w_s={agent.config.get('w_s'):.3f}, w_n={agent.config.get('w_n'):.3f}, threshold_a={agent.config.get('threshold_a'):.3f}, t={agent.config.get('t'):.3f}, alpha_gain={agent.config.get('alpha_gain'):.3f}, beta_val={agent.config.get('beta_val'):.3f}")
 
     for i, trial_info in enumerate(trial_struct):
         try:
@@ -179,54 +186,37 @@ def simulate_one_full_dataset(
             valence_score = float(trial_info['valence_score'])
             norm_category_str = str(trial_info['norm_category_for_trial'])
 
-            salience_input = prob
-            norm_input_val = 1.0 if is_gain_frame else -1.0 # Renamed to avoid clash
-
-            # Prepare the specific params dictionary for this trial for the agent
-            # This dict is passed to the 'params' argument of run_mvnes_trial
-            # It should contain simulation controls and any DDM params the agent expects in this dict
-            # As per agent_mvnes.py, it expects DDM params here too.
-            trial_specific_agent_params = sim_control_params.copy() # Start with base sim controls
-            trial_specific_agent_params['max_time'] = 3.0 if not time_constrained else 1.0
-            
-            # Add all agent DDM parameters to this dictionary from sim_control_params
-            trial_specific_agent_params.update({
-                # Core DDM parameters from sim_control_params
-                'w_s': sim_control_params.get('w_s'),
-                'w_n': sim_control_params.get('w_n'),
-                'threshold_a': sim_control_params.get('threshold_a'),
-                't': sim_control_params.get('t'),
-                'alpha_gain': sim_control_params.get('alpha_gain'),
-                'beta_val': sim_control_params.get('beta_val'),
-                
-                # Optional parameters with defaults
-                'logit_z0': sim_control_params.get('logit_z0', 0.0),
-                'log_tau_norm': sim_control_params.get('log_tau_norm', -0.693147),  # log(0.5)
-                'meta_cognitive_on': sim_control_params.get('meta_cognitive_on', False),
-                
-                # Ensure simulation control parameters are included
-                'noise_std_dev': sim_control_params.get('noise_std_dev', 1.0),
-                'dt': sim_control_params.get('dt', 0.01)
-            })
-            
-            category_mapping = {'default': 0, 'fairness': 1, 'altruism': 2, 'reciprocity': 3, 'trust': 4, 'cooperation': 5}
+            # Calculate norm_category_code early
+            category_mapping = {'default': 0, 'fairness': 1, 'altruism': 2, 
+                             'reciprocity': 3, 'trust': 4, 'cooperation': 5}
             norm_category_code = category_mapping.get(norm_category_str.lower(), 0)
+            
+            salience_input = prob
+            norm_input_val = 1.0 if is_gain_frame else -1.0
 
-            if i < 1: # Log first trial details extensively
-                logging.debug(f"  Trial {i}: salience_input={salience_input:.2f}, norm_input_val={norm_input_val:.2f}, valence_score={valence_score:.2f}, norm_category_code={norm_category_code}")
-                logging.debug(f"  Agent call params dict for trial {i}: {trial_specific_agent_params}")
+            # Extensive trial logging - uncomment only when debugging specific trials
+            # if i < 1:  # Log first trial details extensively
+            #     logging.debug(f"  Trial {i}: prob={prob:.2f}, ...")
+            #     logging.debug(f"  Agent call params dict for trial {i}: {current_trial_run_params}"), "
+                            # f"time_constrained={time_constrained}, "
+                            # f"valence_score={valence_score:.2f}, "
+                            # f"norm_category_code={norm_category_code}")
 
-            trial_output = agent.run_mvnes_trial(
-                salience_input,                     # For agent's 'salience_input'
-                norm_input_val,                     # For agent's 'norm_input'
-                trial_specific_agent_params,         # For agent's 'params' (this is the dict)
-                valence_score_trial=valence_score,  # Explicit keyword
-                norm_category_for_trial=norm_category_code # Explicit keyword
+            # Call the agent's run_mvnes_trial method with the correct signature
+            choice, rt = agent.run_mvnes_trial(
+                is_gain_frame=is_gain_frame,
+                time_constrained=time_constrained,
+                valence_score_trial=valence_score,
+                norm_category_for_trial=norm_category_code
             )
 
             simulated_rows.append({
-                'trial': i + 1, 'prob': prob, 'frame': frame_str_val, 'cond': cond_str_val,
-                'rt': trial_output.get('rt', np.nan), 'choice': trial_output.get('choice', 0)
+                'trial': i + 1,
+                'prob': prob,
+                'frame': frame_str_val,
+                'cond': cond_str_val,
+                'rt': rt,
+                'choice': choice
             })
         except Exception as e:
             logging.error(f"Error in simulate_one_full_dataset trial {i}: {e}", exc_info=True)
@@ -275,10 +265,18 @@ def plot_ppc_distributions(
     if subject_ids_to_plot is None:
         subject_ids_to_plot = list(ppc_results.keys())
     
+    # Use a subset of the most important statistics for plotting
     default_stats = [
-        'prop_gamble_overall', 'mean_rt_overall', 'framing_effect_ntc', 
-        'framing_effect_tc', 'rt_std_overall'
+        'p_gamble_All', 'mean_rt_All', 'std_rt_All',
+        'p_gamble_Gain', 'p_gamble_Loss',
+        'mean_rt_Gain', 'mean_rt_Loss',
+        'framing_effect_ntc', 'framing_effect_tc'
     ]
+    # Only use default stats that exist in the observed data
+    if ppc_results and subject_ids_to_plot and subject_ids_to_plot[0] in ppc_results:
+        observed_keys = set(ppc_results[subject_ids_to_plot[0]].get('observed_summary_stats', {}).keys())
+        default_stats = [s for s in default_stats if s in observed_keys]
+    
     stats_to_plot = stats_to_plot if stats_to_plot is not None else default_stats
     
     plot_dir = output_dir / 'plots'
@@ -331,36 +329,79 @@ def plot_ppc_distributions(
                 plt.close('all')
 
 
-def calculate_detailed_coverage(ppc_results: Dict[str, Any]) -> pd.DataFrame:
-    """Calculate detailed coverage statistics for each subject and statistic."""
+def calculate_detailed_coverage(ppc_results: Dict[str, Any], min_sim_reps: int = 5) -> pd.DataFrame:
+    """
+    Calculate detailed coverage statistics for each subject and statistic.
+    
+    Args:
+        ppc_results: Dictionary containing PPC results for each subject
+        min_sim_reps: Minimum number of simulation replicates required to calculate statistics
+        
+    Returns:
+        DataFrame with coverage statistics for each subject and statistic
+    """
     rows = []
     for subj_id, data in ppc_results.items():
-        obs_stats = data.get('observed_summary_stats')
-        sim_stats_list = data.get('simulated_summary_stats_list')
+        obs_stats = data.get('observed_summary_stats', {})
+        sim_stats_list = data.get('simulated_summary_stats_list', [])
         
         if not obs_stats or not sim_stats_list:
+            logging.debug(f"Skipping subject {subj_id}: missing observed or simulated stats")
             continue
             
         for stat_key, obs_val in obs_stats.items():
-            if pd.isna(obs_val): continue
+            if pd.isna(obs_val):
+                logging.debug(f"Skipping {stat_key} for subject {subj_id}: observed value is NaN")
+                continue
 
+            # Get all non-NaN simulated values for this statistic
             sim_vals_for_stat = [s.get(stat_key) for s in sim_stats_list if s and stat_key in s]
             sim_vals_for_stat = [s for s in sim_vals_for_stat if pd.notna(s)]
-
-            if not sim_vals_for_stat: continue
+            n_sims = len(sim_vals_for_stat)
             
-            sim_mean = np.mean(sim_vals_for_stat)
-            sim_std = np.std(sim_vals_for_stat, ddof=1)
-            ci_95_lower = np.percentile(sim_vals_for_stat, 2.5)
-            ci_95_upper = np.percentile(sim_vals_for_stat, 97.5)
-            covered_95 = int(ci_95_lower <= obs_val <= ci_95_upper)
+            # Skip if not enough simulations
+            if n_sims < min_sim_reps:
+                logging.debug(
+                    f"Insufficient simulations ({n_sims}) for {stat_key} in subject {subj_id}. "
+                    f"Need at least {min_sim_reps} for reliable statistics."
+                )
+                rows.append({
+                    'subject_id': subj_id, 'stat_key': stat_key, 'observed': obs_val,
+                    'simulated_mean': np.nan, 'simulated_std': np.nan,
+                    'covered_95': np.nan, 'ci_95_lower': np.nan, 'ci_95_upper': np.nan,
+                    'n_simulations_for_stat': n_sims
+                })
+                continue
             
-            rows.append({
-                'subject_id': subj_id, 'stat_key': stat_key, 'observed': obs_val,
-                'simulated_mean': sim_mean, 'simulated_std': sim_std,
-                'covered_95': covered_95, 'ci_95_lower': ci_95_lower, 'ci_95_upper': ci_95_upper,
-                'n_simulations_for_stat': len(sim_vals_for_stat)
-            })
+            try:
+                # Calculate statistics
+                sim_mean = np.nanmean(sim_vals_for_stat)
+                sim_std = np.nanstd(sim_vals_for_stat, ddof=1) if n_sims > 1 else np.nan
+                
+                # Calculate percentiles only if we have enough data
+                if n_sims >= 5:  # Minimum for meaningful percentiles
+                    ci_95_lower = np.nanpercentile(sim_vals_for_stat, 2.5)
+                    ci_95_upper = np.nanpercentile(sim_vals_for_stat, 97.5)
+                    covered_95 = int(ci_95_lower <= obs_val <= ci_95_upper)
+                else:
+                    ci_95_lower = ci_95_upper = np.nan
+                    covered_95 = np.nan
+                
+                rows.append({
+                    'subject_id': subj_id, 'stat_key': stat_key, 'observed': obs_val,
+                    'simulated_mean': sim_mean, 'simulated_std': sim_std,
+                    'covered_95': covered_95, 'ci_95_lower': ci_95_lower, 'ci_95_upper': ci_95_upper,
+                    'n_simulations_for_stat': n_sims
+                })
+                
+            except Exception as e:
+                logging.warning(f"Error calculating coverage for {stat_key} in subject {subj_id}: {e}")
+                rows.append({
+                    'subject_id': subj_id, 'stat_key': stat_key, 'observed': obs_val,
+                    'simulated_mean': np.nan, 'simulated_std': np.nan,
+                    'covered_95': np.nan, 'ci_95_lower': np.nan, 'ci_95_upper': np.nan,
+                    'n_simulations_for_stat': n_sims
+                })
             
     if not rows:
         logging.warning("No data for coverage calculation.")
@@ -428,106 +469,164 @@ def main(argv: Sequence[str] | None = None) -> None:
     ppc_results: Dict[str, Any] = {}
     processed_count = 0  # Initialize counter for successfully processed subjects
     
-    for subj_id in tqdm(subjects_to_run, desc="Processing subjects"):
-        logging.info(f"--- Subject {subj_id} ---")
-        
-        # Get subject's empirical parameters
-        subj_fits_row = df_fits[df_fits['subject'] == subj_id].iloc[0]
-        
-        # Prepare parameters for the agent and simulation functions
-        # This dict is passed to simulate_n_replicates -> simulate_one_full_dataset
-        # simulate_one_full_dataset then constructs the 'params' dict for agent.run_mvnes_trial
-        current_subject_params_for_sim_func = {}
-        for fit_param_name, agent_param_name in PARAM_MAP_AGENT.items():
-            current_subject_params_for_sim_func[agent_param_name] = float(subj_fits_row[fit_param_name])
-        
-        # Apply threshold scaling
-        current_subject_params_for_sim_func['threshold_a'] *= args.threshold_scale
-        
-        # Add fixed/default parameters expected by simulate_one_full_dataset's 'params' argument
-        # which are then used to build the dict for agent.run_mvnes_trial
-        current_subject_params_for_sim_func.update({
-            'logit_z0': 0.0,
-            'log_tau_norm': -0.693147, # log(0.5)
-            'meta_cognitive_on': False,
-            'noise_std_dev': 1.0, # Default simulation noise, can be in agent_config
-            'dt': 0.01           # Default simulation dt
-        })
-        logging.debug(f"Parameters for simulate_n_replicates for subj {subj_id}: {current_subject_params_for_sim_func}")
+    # Ensure RNG is seeded once at the start of main()
+    # np.random.seed(args.seed) # This is already done earlier
 
-        # Initialize agent and set its DDM attributes from the subject's fitted params
-        # The agent's run_mvnes_trial will use these attributes via params.get('attr', self.config.get('attr'))
-        # if the key isn't found in the dict passed to its 'params' argument.
-        # OR, if the agent's run_mvnes_trial is written to directly use self.w_s etc.
-        # Our current agent_mvnes.py's run_mvnes_trial uses the passed 'params' dict primarily.
-        agent = MVNESAgent() # Uses its own defaults initially
-        # Override agent's internal parameters with subject-specific ones
-        # These will be accessed by agent.run_mvnes_trial via params.get(..., self.config.get(..., default_agent_val))
-        # Effectively, the dict passed to agent.run_mvnes_trial will contain these.
-        for agent_key, value in current_subject_params_for_sim_func.items():
-            if hasattr(agent, agent_key): # Primarily for DDM parameters like w_s, w_n, etc.
-                setattr(agent, agent_key, value)
-            # Also ensure agent.config has them if agent uses self.config.get() as fallback
-            agent.config[agent_key] = value
+    with tqdm(total=len(subjects_to_run), desc="Processing subjects", unit="subject") as pbar:
+        for subj_id in subjects_to_run: # Simplified tqdm
+            logging.info(f"--- Subject {subj_id} ---")
+            subj_fits_row = df_fits[df_fits['subject'] == subj_id].iloc[0]
 
+            all_sim_stats_for_subject = [] # Collects stats from all pseudo-posterior samples for this subject
 
-        # Prepare subject's empirical trial data
-        df_subj_empirical = df_empirical_processed[df_empirical_processed['subject'] == subj_id].copy()
-        if df_subj_empirical.empty:
-            logging.warning(f"No empirical trial data for subject {subj_id}. Skipping.")
-            continue
-        
-        # Clean and prepare trial_data for get_trial_structure & observed stats
-        # Handle NaNs more carefully, e.g., for RT before get_trial_structure
-        if df_subj_empirical['rt'].isnull().any():
-            rt_mean = df_subj_empirical['rt'].mean()
-            df_subj_empirical['rt'].fillna(rt_mean, inplace=True)
-            logging.warning(f"Filled {df_subj_empirical['rt'].isnull().sum()} NaN RTs with mean {rt_mean} for subject {subj_id}")
-        
-        # Drop rows if critical columns (prob, choice) are NaN AFTER attempting to fill RT
-        df_subj_empirical.dropna(subset=['prob', 'choice', 'rt'], inplace=True)
-        if df_subj_empirical.empty:
-            logging.warning(f"No valid trials after NaN drop for subject {subj_id}. Skipping.")
-            continue
+            # Determine number of parameter sets to use for this subject
+            num_param_sets_to_simulate = 1
+            if args.n_pseudo_posterior_samples > 1:
+                num_param_sets_to_simulate = args.n_pseudo_posterior_samples
+                logging.info(f"Generating {num_param_sets_to_simulate} pseudo-posterior parameter samples for subject {subj_id}.")
+            else:
+                logging.info(f"Using mean fitted parameters for subject {subj_id}.")
 
-        try:
-            trial_struct = get_trial_structure(df_subj_empirical)
-            observed_summary_stats = calculate_summary_stats(df_subj_empirical, ROBERTS_SUMMARY_STAT_KEYS)
-        except Exception as e:
-            logging.error(f"Error preparing data or obs stats for subject {subj_id}: {e}", exc_info=True)
-            continue
+            # Prepare subject's empirical trial data (moved before parameter sampling loop)
+            df_subj_empirical = df_empirical_processed[df_empirical_processed['subject'] == subj_id].copy()
+            if df_subj_empirical.empty:
+                logging.warning(f"No empirical trial data for subject {subj_id}. Skipping.")
+                pbar.update(1)
+                continue
             
-        if not trial_struct:
-            logging.warning(f"Empty trial_struct for subject {subj_id}. Skipping.")
-            continue
-        if not observed_summary_stats:
-            logging.warning(f"Could not compute observed_summary_stats for subject {subj_id}. Skipping.")
-            continue
-        
-        logging.info(f"Running {args.n_sim_reps} simulation replicates for subject {subj_id}.")
-        
-        # Base simulation control parameters (dt, noise) are already in current_subject_params_for_sim_func
-        # which is passed to simulate_n_replicates, then to simulate_one_full_dataset,
-        # and then used to construct the 'params' dict for agent.run_mvnes_trial.
-        simulated_stats_list = simulate_n_replicates(
-            agent=agent, # Agent now has subject-specific DDM params set as attributes
-            trial_struct=trial_struct,
-            base_sim_control_params=current_subject_params_for_sim_func, # This dict contains all needed params
-            n_reps=args.n_sim_reps
-        )
-        
-        if not simulated_stats_list:
-            logging.warning(f"No valid simulation results for subject {subj_id}.")
-            continue
+            # Clean and prepare trial_data for get_trial_structure & observed stats
+            if df_subj_empirical['rt'].isnull().any():
+                rt_mean = df_subj_empirical['rt'].mean()
+                df_subj_empirical = df_subj_empirical.copy()  # Avoid SettingWithCopyWarning
+                df_subj_empirical.loc[:, 'rt'] = df_subj_empirical['rt'].fillna(rt_mean)
+                logging.warning(f"Filled {df_subj_empirical['rt'].isnull().sum()} NaN RTs with mean {rt_mean} for subject {subj_id}")
             
-        ppc_results[subj_id] = {
-            'observed_summary_stats': observed_summary_stats,
-            'simulated_summary_stats_list': simulated_stats_list,
-            'params_used_for_agent_attributes': {k: getattr(agent, k) for k in PARAM_MAP_AGENT.values() if hasattr(agent, k)},
-            'params_passed_to_sim_func': current_subject_params_for_sim_func
-        }
-        processed_count +=1
-        pbar.update(1)
+            # Drop rows if critical columns (prob, choice) are NaN AFTER attempting to fill RT
+            df_subj_empirical.dropna(subset=['prob', 'choice', 'rt'], inplace=True)
+            if df_subj_empirical.empty:
+                logging.warning(f"No valid trials after NaN drop for subject {subj_id}. Skipping.")
+                pbar.update(1)
+                continue
+
+            # Prepare trial structure and observed stats (once per subject)
+            try:
+                trial_struct = get_trial_structure(df_subj_empirical)
+                observed_summary_stats = calculate_summary_stats(df_subj_empirical, ROBERTS_SUMMARY_STAT_KEYS)
+            except Exception as e:
+                logging.error(f"Error preparing data or obs stats for subject {subj_id}: {e}", exc_info=True)
+                pbar.update(1)
+                continue
+                
+            if not trial_struct or not observed_summary_stats:
+                logging.warning(f"Empty trial_struct or obs_stats for subject {subj_id}")
+                pbar.update(1)
+                continue
+
+            for i_param_sample in range(num_param_sets_to_simulate):
+                agent_init_kwargs = {}
+                
+                # Sample or get mean for each of the 6 core DDM parameters
+                for fit_param_csv_key in PARAM_NAMES_FITTED:  # e.g., 'v_norm_mean', 'a_0_mean', ...
+                    base_name_for_sampling = fit_param_csv_key.replace('_mean', '')  # 'v_norm', 'a_0', ...
+                    mean_val = float(subj_fits_row[fit_param_csv_key])
+                    
+                    if args.n_pseudo_posterior_samples > 1:
+                        std_col_csv_key = fit_param_csv_key.replace('_mean', '_std')
+                        std_val = abs(mean_val * 0.1) if mean_val != 0 else 0.01  # Default if not found
+                        if std_col_csv_key in subj_fits_row and pd.notna(subj_fits_row[std_col_csv_key]):
+                            s = float(subj_fits_row[std_col_csv_key])
+                            std_val = max(s, 1e-6) if s > 0 else (abs(mean_val * 0.1) if mean_val != 0 else 0.01)
+                        else:
+                            logging.warning(f"Std dev for {fit_param_csv_key} not found/invalid, using 10% of mean.")
+                        
+                        sampled_value = np.random.normal(loc=mean_val, scale=std_val)
+                    else:
+                        sampled_value = mean_val
+                        
+                    # Apply constraints (clipping)
+                    if base_name_for_sampling == "v_norm":
+                        sampled_value = np.clip(sampled_value, 0.1, 5.0)
+                    elif base_name_for_sampling == "a_0":
+                        sampled_value = np.clip(sampled_value, 0.5, 3.0)
+                    elif base_name_for_sampling == "w_s_eff":
+                        sampled_value = np.clip(sampled_value, 0.3, 0.7)
+                    elif base_name_for_sampling == "t_0":
+                        sampled_value = np.clip(sampled_value, 0.1, 0.5)
+                        if sampled_value < 0.01:
+                            sampled_value = 0.01  # Hard minimum
+                    elif base_name_for_sampling == "alpha_gain":
+                        sampled_value = np.clip(sampled_value, -1.0, 1.0)
+                    elif base_name_for_sampling == "beta_val":
+                        sampled_value = np.clip(sampled_value, -1.0, 1.0)
+                        
+                    # Assign to agent_init_kwargs using the agent's __init__ parameter names
+                    if base_name_for_sampling == "v_norm":
+                        agent_init_kwargs['v_norm'] = sampled_value
+                    elif base_name_for_sampling == "a_0":
+                        agent_init_kwargs['a_0'] = sampled_value  # Will be scaled after sampling & clipping
+                    elif base_name_for_sampling == "w_s_eff":
+                        agent_init_kwargs['w_s_eff'] = sampled_value
+                    elif base_name_for_sampling == "t_0":
+                        agent_init_kwargs['t_0'] = sampled_value
+                    elif base_name_for_sampling == "alpha_gain":
+                        agent_init_kwargs['alpha_gain'] = sampled_value
+                    elif base_name_for_sampling == "beta_val":
+                        agent_init_kwargs['beta_val'] = sampled_value
+                
+                # Apply threshold scaling to the a_0 that will go into init
+                agent_init_kwargs['a_0'] *= args.threshold_scale
+                
+                # Add fixed parameters for agent __init__
+                agent_init_kwargs['logit_z0'] = 0.0
+                agent_init_kwargs['log_tau_norm'] = -0.693147
+                
+                try:
+                    agent = MVNESAgent(**agent_init_kwargs)
+                except ValueError as e_val:
+                    logging.error(f"  Skipping sample {i_param_sample+1} due to invalid param during agent init: {e_val}")
+                    logging.error(f"    Problematic init_kwargs: {agent_init_kwargs}")
+                    continue
+                
+                # Prepare the 'sim_control_params' dictionary for simulate_one_full_dataset
+                # This will be passed as 'params' to agent.run_mvnes_trial
+                sim_params_for_trial_runner = {
+                    'w_s': agent.w_s_eff,  # Use the sampled w_s_eff directly
+                    'w_n': agent.v_norm,
+                    'threshold_a': agent.a_0,
+                    't': agent.t_0,
+                    'alpha_gain': agent.alpha_gain,
+                    'beta_val': agent.beta_val,
+                    'logit_z0': agent.logit_z0,
+                    'log_tau_norm': agent.log_tau_norm,
+                    'meta_cognitive_on': False,
+                    'noise_std_dev': 1.0,
+                    'dt': 0.01
+                }
+                
+                # Run simulations for this parameter set
+                sim_reps_stats = simulate_n_replicates(
+                    agent=agent,
+                    trial_struct=trial_struct,
+                    base_sim_control_params=sim_params_for_trial_runner,
+                    n_reps=args.n_sim_reps
+                )
+                all_sim_stats_for_subject.extend(sim_reps_stats)
+            
+            # After processing all pseudo-posterior samples (or the single mean set) for the subject
+            if not all_sim_stats_for_subject:
+                logging.warning(f"No valid simulation results collected for subject {subj_id} after all samples/reps.")
+                pbar.update(1)
+                continue # to the next subject
+                
+            ppc_results[subj_id] = {
+                'observed_summary_stats': observed_summary_stats,
+                'simulated_summary_stats_list': all_sim_stats_for_subject,
+                'params_reference': "sampled_from_mean_std" if args.n_pseudo_posterior_samples > 1 else "mean_values",
+                'n_pseudo_posterior_samples_used': num_param_sets_to_simulate,
+                'n_reps_per_sample': args.n_sim_reps
+            }
+            processed_count += 1
+            pbar.update(1)
 
     logging.info(f"Successfully processed {processed_count}/{len(subjects_to_run)} subjects.")
 
