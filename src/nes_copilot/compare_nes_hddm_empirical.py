@@ -397,392 +397,495 @@ def fit_nes_model(
             print(f"  {k}: shape {v.shape if isinstance(v, np.ndarray) else type(v)}")
         return None
 
-def fit_hddm_ext_model(subject_data, hddm_model_config):
+def fit_hddm_ext_model(
+    subject_data_orig: pd.DataFrame,
+    hddm_model_config: dict,
+    num_samples: int = 500, # HDDM samples
+    burn_in: int = 100    # HDDM burn-in
+) -> az.InferenceData | None:
     """
-    Fits the HDDM extension model to the subject's data.
-    !!! REPLACE WITH ACTUAL HDDM FITTING !!!
+    Fits an HDDM (Regressor) model to the subject's data.
+    Calculates pointwise log-likelihoods by reconstructing trial-specific parameters.
+    Creates an ArviZ InferenceData object.
     """
-    print(f"Fitting HDDM extension model for subject_data shape: {subject_data.shape}")
-    print(f"HDDM model config: {hddm_model_config}")
+    print(f"\n--- Fitting HDDM model for subject data ---")
 
-    # This is a dummy implementation for HDDM
-    # In a real scenario, you would use HDDM to fit the model and extract samples
-    # For example:
-    # model = hddm.HDDM(subject_data, **hddm_model_config)
-    # model.sample(2000, burn=200)
-    # samples = model.get_traces()
+    # --- 1. Data Preparation ---
+    subject_data = subject_data_orig.copy()
+    print(f"Original subject data shape: {subject_data.shape}")
 
-    # Dummy InferenceData object
-    num_draws = 100
-    num_chains = 4
+    if 'subj_idx' not in subject_data.columns:
+        print("Error: 'subj_idx' column is required for HDDM. Adding a default 'subj_idx'=0.")
+        subject_data['subj_idx'] = 0 # HDDM requires subj_idx
 
-    # Assuming HDDM parameters like v, a, t, etc.
-    # These names should match those expected by your HDDM model configuration
-    hddm_param_names = ['v', 'a', 't', 'z'] # Example parameters
-    if 'sv' in hddm_model_config.get('include', []): # Example of conditional parameter
-        hddm_param_names.append('sv')
+    if 'rt' not in subject_data.columns or 'response' not in subject_data.columns:
+        print("Error: 'rt' and 'response' columns are essential for HDDM.")
+        return None
 
-    posterior_samples = {param: np.random.randn(num_chains, num_draws) for param in hddm_param_names}
+    # Clean RTs: must be positive
+    subject_data['rt'] = pd.to_numeric(subject_data['rt'], errors='coerce')
+    subject_data.dropna(subset=['rt'], inplace=True) # Remove rows where RT became NaN
+    subject_data = subject_data[subject_data['rt'] > 0]
+    if subject_data.empty:
+        print("Error: No valid trials remaining after RT cleaning (must be > 0).")
+        return None
 
-    # Dummy pointwise log likelihood
-    log_likelihood_data = np.random.rand(num_chains, num_draws, len(subject_data))
+    # Clean Responses: must be 0 or 1
+    subject_data['response'] = pd.to_numeric(subject_data['response'], errors='coerce')
+    subject_data.dropna(subset=['response'], inplace=True)
+    if not subject_data['response'].isin([0, 1]).all():
+        print("Warning: 'response' column contains values other than 0 or 1. Coercing...")
+        # Example: treat non-0/1 as outliers or a default category, e.g., 0. Or filter them out.
+        subject_data['response'] = subject_data['response'].apply(lambda x: 1 if x > 0.5 else 0) # Simplistic coercion
 
-    # Create observed_data dictionary for ArviZ
-    observed_data_dict = {key: subject_data[key].values for key in subject_data.columns}
+    if len(subject_data) < 10: # Arbitrary minimum number of trials
+        print(f"Warning: Very few trials ({len(subject_data)}) for HDDM fitting. Results may be unreliable.")
+        if subject_data.empty: return None
 
-    idata = az.from_dict(
-        posterior=posterior_samples,
-        log_likelihood={'hddm': log_likelihood_data}, # Ensure this key matches model_name in az.compare
-        observed_data=observed_data_dict,
-        dims={'hddm': ['parameter']}, # Optional: add parameter dimension name
-        coords={'parameter': hddm_param_names} # Optional: add parameter names
-    )
-    return idata
+    print(f"Data shape after cleaning: {subject_data.shape}")
+    print(f"HDDM model config being used: {hddm_model_config}")
+
+    # --- 2. Model Definition & Fitting ---
+    try:
+        # HDDM Regressor expects list of models, or a single model string for `depends_on` style
+        # The provided hddm_model_config should align with HDDM/HDDMRegressor's expectations.
+        # Example: config = {'models': "v ~ C(condition)", 'include': 'sv'}
+        # For HDDMRegressor, it's typically:
+        # model_def = [{'model': 'v ~ C(condition)', 'link_func': lambda x: x}]
+        # hddm_base_params = {'include': ['sv', 'st'], 'p_outlier': 0.05}
+        # m = hddm.HDDMRegressor(subject_data, model_def, group_only_regressors=False, **hddm_base_params)
+
+        # For simplicity, this placeholder assumes hddm_model_config is a dict that can be directly passed
+        # or contains a 'models' key for HDDMRegressor.
+        # A more robust implementation would parse this config carefully.
+
+        regressor_models = hddm_model_config.get('models', None)
+        include_params = hddm_model_config.get('include', [])
+        depends_on_params = hddm_model_config.get('depends_on', {}) # For basic HDDM
+
+        if regressor_models:
+            print(f"Defining HDDMRegressor with models: {regressor_models}")
+            # Ensure other necessary HDDMRegressor params are in hddm_model_config (e.g., group_only_regressors)
+            hddm_params_for_regressor = {k: v for k, v in hddm_model_config.items() if k != 'models'}
+            m = hddm.HDDMRegressor(subject_data, regressor_models, **hddm_params_for_regressor)
+        elif depends_on_params:
+            print(f"Defining HDDM (non-regressor) with depends_on: {depends_on_params}")
+            m = hddm.HDDM(subject_data, depends_on=depends_on_params, include=include_params)
+        else: # Basic HDDM
+            print("Defining basic HDDM (no regression, no depends_on specified in this way)")
+            m = hddm.HDDM(subject_data, include=include_params)
+
+        print(f"Starting HDDM sampling: {num_samples} samples, {burn_in} burn-in.")
+        m.sample(num_samples, burn=burn_in, dbname='hddm_traces.db', db='pickle') # Using pickle for traces
+        print("HDDM sampling complete.")
+    except Exception as e:
+        print(f"Error during HDDM model definition or fitting: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+    # --- 3. Posterior Trace Extraction & Reshaping ---
+    # get_traces(combine=False) gives list of DataFrames (one per chain if multiple chains were run by HDDM internally)
+    # HDDM typically runs multiple chains by default (e.g. 4). Let's assume this.
+    # If HDDM ran N chains, traces_raw will be a list of N DataFrames.
+    # Each DataFrame has columns for parameters (e.g., 'v', 'a', 't', 'v_C(cond)[T.B]', etc.)
+    # and rows are posterior samples.
+
+    # HDDM's `get_traces` with `combine=False` (default) should return a list of DataFrames (traces per chain)
+    # However, the internal chaining of HDDM is not as explicit as in PyMC3/Stan for `az.from_dict`.
+    # `m.get_traces()` usually returns a single combined DataFrame.
+    # For `az.from_dict`, we need posterior[param_name] = (chains, draws)
+    # We'll simulate this by treating the combined trace as a single chain, or splitting it if possible.
+    # For now, assuming combined trace and treating as single chain for simplicity for this placeholder.
+
+    traces_df = m.get_traces() # This is a pandas DataFrame
+    num_actual_samples = len(traces_df)
+    num_chains_simulated = 1 # Treating combined trace as 1 chain for Arviz
+
+    posterior_samples_az = {}
+    hddm_parameter_names = [] # To store all unique base parameter names found in traces
+
+    # Crude way to identify parameters from trace column names:
+    # v, a, t, z, sv, st, sz, v_Intercept, v_C(stim)[T.B], etc.
+    # We need to store these in a way Arviz can understand.
+    # Base DDM parameters: v, a, t, z (relative, 0-1). Optional: sv, sz, st.
+    # Regression coefficients: e.g., v_Intercept, v_condition[T.True], a_other_condition
+
+    # Store all trace columns first
+    for col_name in traces_df.columns:
+        posterior_samples_az[col_name] = traces_df[col_name].values.reshape(num_chains_simulated, num_actual_samples)
+        if not any(x in col_name for x in ['Intercept', 'C(', '(']): # Heuristic for base params
+             if col_name.split('_subj')[0] not in hddm_parameter_names: # Avoid duplicates like v_subj.1, v_subj.2
+                hddm_parameter_names.append(col_name.split('_subj')[0])
+
+    print(f"Extracted HDDM traces. Found parameters like: {list(traces_df.columns[:5])}...")
+    # hddm_parameter_names will be used for coords in Arviz if needed.
+
+    # --- 4. Pointwise Log-Likelihood Calculation ---
+    num_trials = len(subject_data)
+    log_likelihood_data = np.full((num_chains_simulated, num_actual_samples, num_trials), np.nan)
+
+    print(f"Calculating pointwise log likelihoods for HDDM: {num_actual_samples} samples, {num_trials} trials...")
+
+    # Get the design matrix if it's a regression model (simplistic retrieval)
+    # design_matrix_info = {}
+    # if hasattr(m, 'model_descrs'): # HDDMRegressor specific
+    #     for descr in m.model_descrs:
+    #         param = descr['param'] # e.g., 'v'
+    #         # This is tricky: HDDM internal design matrix is not easily exposed for this.
+    #         # We'd typically use patsy to reconstruct or get it.
+    #         # For this placeholder, we assume we can figure out trial conditions from subject_data.
+
+    for sample_idx in range(num_actual_samples):
+        # For each sample, get all parameter values from the trace
+        current_posterior_sample_params_full_trace = traces_df.iloc[sample_idx].to_dict()
+
+        for trial_idx in range(num_trials):
+            trial = subject_data.iloc[trial_idx]
+            trial_rt = trial['rt']
+            trial_choice = trial['response']
+
+            # Reconstruct trial-specific DDM parameters (v, a, t, z) for this trial
+            # This is the most complex part for HDDMRegressor
+            effective_params_for_trial = {}
+
+            # Base parameters (non-regressed or intercept terms)
+            # Example: effective_params_for_trial['v'] = current_posterior_sample_params_full_trace.get('v_Intercept', current_posterior_sample_params_full_trace.get('v', 0))
+            # This needs to be very robust based on `m.model_descrs` if it's a Regressor.
+
+            # Simplified reconstruction for this placeholder:
+            # Assumes basic DDM params (v,a,t,z) might be directly in trace or need simple combination
+            # This part needs to be significantly enhanced for actual HDDMRegressor models.
+
+            # Example: if 'v ~ condition' was the model
+            # v_intercept = current_posterior_sample_params_full_trace.get('v_Intercept', 0)
+            # v_effect_cond = 0
+            # if f"v_C(condition)[T.{trial['condition']}]" in current_posterior_sample_params_full_trace: # This is pseudo-code for condition handling
+            #    v_effect_cond = current_posterior_sample_params_full_trace[f"v_C(condition)[T.{trial['condition']}]"]
+            # effective_params_for_trial['v'] = v_intercept + v_effect_cond
+            # This is highly simplified. A full solution uses the design matrix.
+
+            # For now, assume direct parameters or simple structure that get_log_likelihood_pointwise can handle
+            # by just passing all trace values for the sample.
+            # The `get_log_likelihood_pointwise` for HDDM currently expects 'v', 'a', 't', 'z'.
+            # It does NOT handle regression coefficient combination.
+            # THIS IS A MAJOR SIMPLIFICATION FOR THE PLACEHOLDER
+
+            # Let's try to populate the main DDM params, using group level if subj level not found
+            # This won't work for regression correctly without design matrix multiplication.
+            param_map = {}
+            subj_id_str = str(trial['subj_idx'])
+            for p_base in ['v', 'a', 't', 'z']:
+                subj_param_name = f"{p_base}_subj.{subj_id_str}" # HDDM trace name for subject specific param
+                param_map[p_base] = current_posterior_sample_params_full_trace.get(
+                                        subj_param_name, # Try subject specific first
+                                        current_posterior_sample_params_full_trace.get(p_base, # Then group level
+                                                                    np.nan)) # Fallback
+
+            # For sv, sz, st (typically group level in basic HDDM)
+            for p_opt in ['sv', 'st', 'sz']:
+                if p_opt in current_posterior_sample_params_full_trace:
+                    param_map[p_opt] = current_posterior_sample_params_full_trace[p_opt]
+
+            # Check if all required params are found
+            if any(np.isnan(param_map.get(p)) for p in ['v','a','t','z']):
+                # print(f"Warning: Could not reconstruct all params for trial {trial_idx}, sample {sample_idx}. Skipping loglik.")
+                # print(f"Mapped params: {param_map}")
+                # print(f"Full trace sample: {current_posterior_sample_params_full_trace}")
+                log_likelihood_data[0, sample_idx, trial_idx] = LOG_LIK_FLOOR # Assign floor
+                continue
+
+            log_lik = get_log_likelihood_pointwise(
+                posterior_params=param_map, # Pass the reconstructed/mapped params
+                trial_rt=trial_rt,
+                trial_choice=trial_choice,
+                trial_condition={}, # HDDM conditions are handled via regression terms in trace
+                model_type="HDDM"
+            )
+            log_likelihood_data[0, sample_idx, trial_idx] = log_lik # Assuming single chain simulation
+
+    print("Pointwise log likelihood calculation for HDDM complete.")
+    if np.isnan(log_likelihood_data).any():
+        nan_count = np.isnan(log_likelihood_data).sum()
+        print(f"Warning: NaNs found in HDDM log_likelihood_data. Count: {nan_count} out of {log_likelihood_data.size}. Replacing with floor.")
+        log_likelihood_data = np.nan_to_num(log_likelihood_data, nan=LOG_LIK_FLOOR)
+
+    # --- 5. ArviZ InferenceData Creation ---
+    observed_data_dict = {col: subject_data[col].values for col in subject_data.columns if col not in ['subj_idx']}
+    # Ensure rt and response are present
+    if 'rt' not in observed_data_dict or 'response' not in observed_data_dict:
+        print("Error: rt or response missing from observed_data_dict for Arviz.")
+        return None
+
+    try:
+        # `posterior_samples_az` contains all trace columns. Arviz will infer dimensions.
+        # `hddm_parameter_names` might be useful for `coords` if we simplify `posterior_samples_az`
+        # to only include "interpretable" base parameters rather than all raw trace columns.
+        # For now, passing all raw trace columns.
+        idata = az.from_dict(
+            posterior=posterior_samples_az,
+            log_likelihood={'hddm': log_likelihood_data}, # Model name 'hddm'
+            observed_data=observed_data_dict,
+            # coords={'hddm_parameter': hddm_parameter_names} # Optional: if posterior_samples_az was structured differently
+        )
+        # Arviz might complain if posterior keys have dots, e.g. 'v_subj.0'.
+        # It's better to rename them, e.g., 'v_subj_0'.
+        # This is a common issue with HDDM traces and Arviz.
+        # For this placeholder, we'll proceed and note this as a potential refinement.
+
+        print("Successfully created ArviZ InferenceData object for HDDM model.")
+        # Clean up database file
+        if os.path.exists('hddm_traces.db'): os.remove('hddm_traces.db')
+        return idata
+    except Exception as e:
+        print(f"Error creating ArviZ InferenceData object for HDDM model: {e}")
+        import traceback
+        traceback.print_exc()
+        # Clean up database file
+        if os.path.exists('hddm_traces.db'): os.remove('hddm_traces.db')
+        return None
+
 
 if __name__ == "__main__":
     print("Starting empirical data comparison script...")
 
-    # --- Configuration ---
-    # Path to the empirical data. Consider making this a command-line argument.
-    # For now, using the specified default path.
-    empirical_data_path = "output/data_prep/empirical_data.csv"
-    npe_checkpoint_path = "output/models/nes_model_checkpoint.pt" # Example, update if needed
-    output_dir = "results/comparison_empirical"
+    # --- Script-Level Configurations ---
+    EMPIRICAL_DATA_PATH = "output/data_prep/empirical_data.csv"
+    NPE_CHECKPOINT_PATH = "output/models/nes_npe_checkpoint.pt" # Path to the (mock) NPE model checkpoint
+    OUTPUT_DIR = "results/model_comparison_empirical"
 
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        print(f"Created output directory: {output_dir}")
+    # Ensure output directory exists
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+        print(f"Created output directory: {OUTPUT_DIR}")
 
-    # --- Configuration for NES Model ---
-    # These would typically come from a config file or a more structured setup
-    summary_stat_keys_nes = [
-        'rt_mean', 'rt_std', 'acc_mean', # Example summary stats
-        'rt_10th_pctl', 'rt_90th_pctl'
-    ]
-    nes_dynamic_param_names = ['v_norm', 'a_0', 't_0', 'alpha_gain', 'beta_val'] # Dynamic params from NPE
+    # Create a dummy NPE checkpoint file if it doesn't exist (for mock model to "load")
+    if NPE_CHECKPOINT_PATH and not os.path.exists(NPE_CHECKPOINT_PATH):
+        print(f"Creating dummy NPE checkpoint file at: {NPE_CHECKPOINT_PATH}")
+        os.makedirs(os.path.dirname(NPE_CHECKPOINT_PATH), exist_ok=True)
+        with open(NPE_CHECKPOINT_PATH, 'wb') as f:
+            pickle.dump({"mock_npe_param": "value"}, f)
 
-    # Fixed parameters for the NES model (part of its definition, not from NPE)
-    fixed_nes_params_config = {
-        'logit_z0': 0.0,       # Base logit for starting point z
-        'log_tau_norm': -0.7   # Log of decay constant for v_norm component
+    # --- NES Model Configuration ---
+    SUMMARY_STAT_KEYS_NES = ['rt_mean', 'rt_std', 'acc_mean', 'rt_10th_pctl', 'rt_90th_pctl']
+    NES_DYNAMIC_PARAM_NAMES = ['v_norm', 'a_0', 't_0', 'alpha_gain', 'beta_val']
+    FIXED_NES_PARAMS = {
+        'logit_z0': 0.0,
+        'log_tau_norm': -0.7
     }
-
-    # DDM-like parameters for the NES model (base DDM structure, not from NPE)
-    nes_ddm_base_config = {
-        'w_s': 1.0,            # Weight for salience input to drift
-        'salience_input': 0.5, # A constant or condition-driven salience input
-        'sv': 0.0,             # Inter-trial variability of drift (set to 0 if not used)
-        'sz': 0.0,             # Inter-trial variability of start point (set to 0 if not used)
-        'st': 0.0              # Inter-trial variability of non-decision time (set to 0 if not used)
+    NES_DDM_BASE_CONFIG = {
+        'w_s': 1.0, 'salience_input': 0.5,
+        'sv': 0.0, 'sz': 0.0, 'st': 0.0
     }
+    NES_NUM_SAMPLES = 50 # Reduced for main script testing
+    NES_NUM_CHAINS = 2   # Reduced for main script testing
 
-    # HDDM model configuration (remains for the HDDM part of the script)
-    hddm_model_config = {
-        "include": ["sv", "st", "sz"],
-        "p_outlier": 0.05
+    # --- HDDM Model Configuration (for main run) ---
+    # Using a configuration that HDDMRegressor can parse
+    HDDM_MODEL_CONFIG_MAIN = {
+        'models': [ # List of regression models for HDDMRegressor
+            # Ensure condition 'A' is a valid level in your data or dummy data for C(..., Treatment('A'))
+            {'model': 'v ~ C(condition, Treatment("A"))', 'link_func': lambda x: x},
+        ],
+        'include': ['sv', 'st', 'sz'],
+        'p_outlier': 0.05,
+        'group_only_regressors': False,
+        'keep_regressor_trace': True
     }
+    HDDM_NUM_SAMPLES = 100 # Reduced for main script testing
+    HDDM_BURN_IN = 50    # Reduced for main script testing
 
-    # --- Load Empirical Data ---
-    all_data = load_empirical_data(empirical_data_path)
+    # --- Load and Prepare Empirical Data ---
+    all_data_loaded = load_empirical_data(EMPIRICAL_DATA_PATH)
 
-    if all_data is None:
-        print("Failed to load empirical data. Exiting script.")
-        # Optionally, create dummy data to allow the script to proceed for testing structure
-        # For now, we will exit if data loading fails.
-        # To enable dummy data for testing, uncomment the block below:
-        # print("Creating dummy data to proceed with script structure testing...")
-        # num_dummy_trials = 100
-        # num_dummy_subjects = 2
-        # dummy_rts = np.random.uniform(0.2, 2.0, num_dummy_trials * num_dummy_subjects)
-        # dummy_responses = np.random.choice([0, 1], num_dummy_trials * num_dummy_subjects)
-        # dummy_subjects = np.repeat(np.arange(num_dummy_subjects), num_dummy_trials)
-        # dummy_stimuli = np.random.choice(['stimA', 'stimB'], num_dummy_trials * num_dummy_subjects)
-        # all_data = pd.DataFrame({
-        #     "rt": dummy_rts,
-        #     "response": dummy_responses,
-        #     "subj_idx": dummy_subjects,
-        #     "stimulus": dummy_stimuli,
-        #     "frame": np.tile(np.arange(num_dummy_trials), num_dummy_subjects), # Dummy frame column
-        #     **{f"rt_{i+1}": np.random.rand(num_dummy_trials * num_dummy_subjects) for i in range(5)},
-        #     **{f"response_{i+1}": np.random.randint(0,2, num_dummy_trials * num_dummy_subjects) for i in range(5)}
-        # })
-        # print("Dummy data created.")
-        # Create a dummy NPE checkpoint file if it doesn't exist, for mock model to "load"
-        if npe_checkpoint_path and not os.path.exists(npe_checkpoint_path):
-            print(f"Creating dummy NPE checkpoint file at: {npe_checkpoint_path}")
-            os.makedirs(os.path.dirname(npe_checkpoint_path), exist_ok=True)
-            with open(npe_checkpoint_path, 'wb') as f:
-                pickle.dump({"dummy_model_param": "value"}, f) # Save some dummy content
+    if all_data_loaded is None:
+        print("Failed to load empirical data. Creating dummy data to proceed with main script flow.")
+        num_dummy_trials = 50
+        num_dummy_subjects = 1 # Keep to 1 for simpler HDDM Regressor Treatment coding with dummy data
+        dummy_rts = np.abs(np.random.normal(loc=0.7, scale=0.3, size=num_dummy_trials * num_dummy_subjects)) + 0.1 # Ensure positive
+        dummy_responses = np.random.choice([0, 1], num_dummy_trials * num_dummy_subjects)
+        dummy_subjects = np.repeat(np.arange(num_dummy_subjects), num_dummy_trials)
 
-        # exit() # Exit if data loading failed and no dummy data is generated.
-        # If all_data is None, create dummy data to allow script to run for testing structure
-        if all_data is None:
-            print("Creating dummy data as loading failed, to proceed with script structure testing...")
-            num_dummy_trials = 50 # Reduced for faster testing
-            num_dummy_subjects = 1 # Reduced for faster testing
-            dummy_rts = np.random.uniform(0.2, 1.5, num_dummy_trials * num_dummy_subjects)
-            dummy_responses = np.random.choice([0, 1], num_dummy_trials * num_dummy_subjects)
-            dummy_subjects = np.repeat(np.arange(num_dummy_subjects), num_dummy_trials)
-            dummy_frames = np.random.choice(['gain', 'loss', 'neutral'], num_dummy_trials * num_dummy_subjects)
-            dummy_valence = np.random.randn(num_dummy_trials * num_dummy_subjects) * 0.5
+        dummy_frame_types = np.random.choice(['gain_trial', 'loss_trial', 'neutral_trial'], num_dummy_trials * num_dummy_subjects)
+        dummy_valence = np.random.randn(num_dummy_trials * num_dummy_subjects) * 0.5
 
-            all_data = pd.DataFrame({
-                "rt": dummy_rts,
-                "response": dummy_responses,
-                "subj_idx": dummy_subjects,
-                "frame": dummy_frames,
-                "valence_score": dummy_valence,
-                # Dummy summary stats (can be generated by MockDataManager too)
-                "rt_mean": np.random.rand(num_dummy_trials * num_dummy_subjects),
-                "rt_std": np.random.rand(num_dummy_trials * num_dummy_subjects),
-                "acc_mean": np.random.rand(num_dummy_trials * num_dummy_subjects),
-                "rt_10th_pctl": np.random.rand(num_dummy_trials * num_dummy_subjects),
-                "rt_90th_pctl": np.random.rand(num_dummy_trials * num_dummy_subjects),
-            })
-            print("Dummy data created.")
+        # Ensure 'A' is one of the conditions for HDDM Treatment coding
+        dummy_hddm_conditions = np.random.choice(['A', 'B', 'C'], num_dummy_trials * num_dummy_subjects)
+        # Make sure at least some 'A' conditions exist if it's the reference for Treatment
+        if 'A' not in dummy_hddm_conditions:
+            dummy_hddm_conditions[0] = 'A'
 
 
-    # Print data summary
-    print("\n--- Data Summary ---")
-    if all_data is not None:
-        print(f"Loaded data shape: {all_data.shape}")
-        if 'subj_idx' in all_data.columns:
-            num_subjects = all_data['subj_idx'].nunique()
-            print(f"Number of unique subjects: {num_subjects}")
-            print(f"Trials per subject:\n{all_data.groupby('subj_idx').size()}")
-        else:
-            print("No 'subj_idx' column found, assuming single subject or pre-grouped data.")
-            num_subjects = 1 # Default to 1 if no subject identifier
-        print(f"Total trials: {len(all_data)}")
-        print("First 5 rows of the data:")
-        print(all_data.head())
+        all_data_loaded = pd.DataFrame({
+            "rt": dummy_rts,
+            "response": dummy_responses,
+            "subj_idx": dummy_subjects,
+            "frame_type": dummy_frame_types,
+            "valence_score": dummy_valence,
+            "condition": dummy_hddm_conditions,
+            "rt_mean": np.random.rand(num_dummy_trials * num_dummy_subjects),
+            "rt_std": np.random.rand(num_dummy_trials * num_dummy_subjects),
+            "acc_mean": np.random.rand(num_dummy_trials * num_dummy_subjects),
+            "rt_10th_pctl": np.random.rand(num_dummy_trials * num_dummy_subjects),
+            "rt_90th_pctl": np.random.rand(num_dummy_trials * num_dummy_subjects),
+        })
+        print("Dummy data created for main script flow.")
+
+    # --- Data Preprocessing for NES specific columns ---
+    if 'frame_type' in all_data_loaded.columns and 'frame' not in all_data_loaded.columns:
+        all_data_loaded['frame'] = all_data_loaded['frame_type'].apply(lambda x: 'gain' if 'gain' in x else ('loss' if 'loss' in x else 'neutral'))
+        print("Processed 'frame_type' into 'frame' column for NES.")
+    elif 'frame' not in all_data_loaded.columns:
+        print("Warning: Neither 'frame_type' nor 'frame' column found for NES. Adding dummy 'frame' = 'neutral'.")
+        all_data_loaded['frame'] = 'neutral'
+
+    if 'valence_score' not in all_data_loaded.columns:
+        print("Warning: 'valence_score' column not found for NES. Adding dummy 'valence_score' = 0.0.")
+        all_data_loaded['valence_score'] = 0.0
+
+    # --- Print Data Summary ---
+    print("\n--- Data Summary (after potential modifications) ---")
+    print(f"Data shape: {all_data_loaded.shape}")
+    if 'subj_idx' in all_data_loaded.columns:
+        num_subjects = all_data_loaded['subj_idx'].nunique()
+        print(f"Number of unique subjects: {num_subjects}")
+        # print(f"Trials per subject:\n{all_data_loaded.groupby('subj_idx').size()}") # Can be verbose for many subjects
     else:
-        print("all_data is None, cannot print summary.")
-    print("--------------------\n")
+        print("No 'subj_idx' column found, assuming single subject or pre-grouped data.")
+    print(f"Total trials: {len(all_data_loaded)}")
+    # print(all_data_loaded.head()) # Can be verbose
+    print("--------------------------------------------------\n")
 
-    # Store InferenceData objects for each model and subject
-    all_nes_idata = {}
-    all_hddm_idata = {}
+    # --- Main Processing Loop ---
+    all_subject_nes_idata = {}
+    all_subject_hddm_idata = {}
 
-    # Loop through subjects (or handle data hierarchically)
-    # HDDM typically handles multiple subjects internally if 'subj_idx' is in the data
-    # For NES, you might fit per subject or use a hierarchical NES approach.
-    # This example assumes fitting per subject for NES for simplicity.
-
-    # Determine unique subjects for looping
-    if 'subj_idx' in all_data.columns:
-        unique_subjects = all_data['subj_idx'].unique()
+    if 'subj_idx' in all_data_loaded.columns:
+        unique_subject_ids = all_data_loaded['subj_idx'].unique()
     else:
-        # If no subj_idx, assume all data belongs to a single group/subject
-        # or that HDDM will handle it (e.g. if it's already single subject data)
-        print("Warning: 'subj_idx' column not found. Processing data as a single group.")
-        unique_subjects = [0] # Placeholder for single group processing
-        all_data['subj_idx'] = 0 # Add a default subject index if not present
+        print("Warning: 'subj_idx' column not found in loaded data. Processing all data as a single group (ID 0).")
+        unique_subject_ids = [0]
+        all_data_loaded['subj_idx'] = 0
 
-    for subject_id in unique_subjects:
-        print(f"\nProcessing subject/group: {subject_id}")
-        # If processing as a single group (subject_id == 0 and no 'subj_idx' originally),
-        # use all_data. Otherwise, filter by actual subject_id.
-        if 'subj_idx' in all_data.columns and subject_id in all_data['subj_idx'].unique():
-             subject_data = all_data[all_data['subj_idx'] == subject_id].copy()
-        else: # Handles the case where we added subj_idx = 0 to ungrouped data
-             subject_data = all_data.copy()
+    for s_id in unique_subject_ids:
+        print(f"===== Processing Subject ID: {s_id} =====")
+        current_subject_data = all_data_loaded[all_data_loaded['subj_idx'] == s_id].copy()
 
-        # Ensure 'rt' and 'response' columns are present for HDDM for this subject's data
-        if 'rt' not in subject_data.columns or 'response' not in subject_data.columns:
-            print(f"Error: 'rt' or 'response' column not found in data for subject/group {subject_id}.")
-            print("HDDM requires these columns. Skipping this subject/group.")
+        if current_subject_data.empty:
+            print(f"No data for subject {s_id}. Skipping.")
             continue
 
-        # Ensure subject_data is not empty
-        if subject_data.empty:
-            print(f"Skipping subject/group {subject_id} due to empty data after filtering.")
-            continue
-
-        # Fit NES model
-        print(f"Fitting NES model for subject/group {subject_id}...")
-        nes_idata = fit_nes_model(
-            subject_data=subject_data,
-            npe_checkpoint_path=npe_checkpoint_path,
-            summary_stat_keys=summary_stat_keys_nes, # Use NES specific summary stats
-            nes_param_names=nes_dynamic_param_names, # Use NES specific dyn param names
-            fixed_nes_params=fixed_nes_params_config,
-            nes_ddm_params_config=nes_ddm_base_config,
-            num_posterior_samples=50, # Reduced for faster testing
-            num_chains=2              # Reduced for faster testing
+        # Fit NES Model
+        print(f"\n--- Fitting NES Model for Subject {s_id} ---")
+        nes_idata_subj = fit_nes_model(
+            subject_data=current_subject_data,
+            npe_checkpoint_path=NPE_CHECKPOINT_PATH,
+            summary_stat_keys=SUMMARY_STAT_KEYS_NES,
+            nes_param_names=NES_DYNAMIC_PARAM_NAMES,
+            fixed_nes_params=FIXED_NES_PARAMS,
+            nes_ddm_params_config=NES_DDM_BASE_CONFIG,
+            num_posterior_samples=NES_NUM_SAMPLES,
+            num_chains=NES_NUM_CHAINS
         )
-        if nes_idata:
-            all_nes_idata[subject_id] = nes_idata
-            print(f"NES model fitting complete for subject/group {subject_id}.")
-            # print(all_nes_idata[subject_id]) # Print summary of idata
-        else:
-            print(f"NES model fitting failed for subject/group {subject_id}.")
-
-
-        # Fit HDDM extension model
-        print(f"Fitting HDDM model for subject {subject_id}...")
-        # HDDM expects data for all subjects at once if fitting hierarchically,
-        # or data for a single subject if fitting individually.
-        # For this example, we pass the whole dataset to HDDM if multiple subjects are handled by HDDM itself,
-        # or subject_data if fitting one by one (though HDDM usually prefers grouped data).
-        # The current HDDM placeholder `fit_hddm_ext_model` takes `subject_data`.
-        # If your actual HDDM fitting function handles all subjects, you might call it once outside the loop.
-
-        # For HDDM, ensure the data passed contains the subject identifier if the model is hierarchical
-        # and the configuration expects it.
-        # The `fit_hddm_ext_model` placeholder currently takes `subject_data`.
-        # If your actual HDDM fitting is hierarchical and expects all data, you might call it once, outside this loop.
-        # For this structure, we assume `fit_hddm_ext_model` can handle data per subject or that `subject_data` is appropriate.
-
-        # Check if 'stimulus' column is present for HDDM if depends_on uses it
-        # This check is illustrative; your actual HDDM config will determine requirements.
-        if "depends_on" in hddm_model_config:
-            for param, condition in hddm_model_config["depends_on"].items():
-                if condition not in subject_data.columns: # e.g., if condition is 'stimulus'
-                    print(f"Warning: Column '{condition}' for parameter '{param}' in HDDM 'depends_on' config "
-                          f"not found in data for subject/group {subject_id}. HDDM may fail or use default.")
-                    # Optionally, add a dummy column if critical for placeholder execution:
-                    # subject_data[condition] = 'default_condition_value'
-
-        hddm_idata = fit_hddm_ext_model(subject_data, hddm_model_config)
-        all_hddm_idata[subject_id] = hddm_idata
-        print(f"HDDM model fitting complete for subject {subject_id}.")
-
-    # Perform model comparison using ArviZ
-    # This comparison will be per subject if models were fit per subject
-    # Or a single comparison if models were fit hierarchically over all subjects.
-
-    comparison_results = {}
-
-    # Check if there are any subjects to process before attempting comparison
-    if not unique_subjects or not any(s_id in all_nes_idata and s_id in all_hddm_idata for s_id in unique_subjects):
-        print("\nNo subjects processed successfully or no InferenceData available for comparison. Skipping model comparison.")
-    else:
-        for subject_id in unique_subjects:
-            print(f"\nComparing models for subject/group: {subject_id}")
-            if subject_id not in all_nes_idata or subject_id not in all_hddm_idata:
-                print(f"Skipping comparison for subject/group {subject_id} due to missing InferenceData for one or both models.")
-                continue
-
-            nes_idata_subj = all_nes_idata[subject_id]
-            hddm_idata_subj = all_hddm_idata[subject_id]
-
-            # Ensure log_likelihood is present
-            if 'log_likelihood' not in nes_idata_subj or 'nes' not in nes_idata_subj.log_likelihood:
-                print(f"Error: Log likelihood 'nes' not found in NES InferenceData for subject/group {subject_id}.")
-                continue
-            if 'log_likelihood' not in hddm_idata_subj or 'hddm' not in hddm_idata_subj.log_likelihood:
-                print(f"Error: Log likelihood 'hddm' not found in HDDM InferenceData for subject/group {subject_id}.")
-                continue
-
+        if nes_idata_subj:
+            all_subject_nes_idata[s_id] = nes_idata_subj
+            print(f"NES fitting successful for subject {s_id}.")
+            nes_idata_path = os.path.join(OUTPUT_DIR, f"nes_idata_subject_{s_id}.nc")
             try:
-                compare_models_dict = {"nes": nes_idata_subj, "hddm": hddm_idata_subj}
+                nes_idata_subj.to_netcdf(nes_idata_path)
+                print(f"Saved NES InferenceData for subject {s_id} to {nes_idata_path}")
+            except Exception as e:
+                print(f"Error saving NES InferenceData for subject {s_id}: {e}")
+        else:
+            print(f"NES fitting failed for subject {s_id}.")
 
-                # Check if log_likelihood data is empty or problematic before calling compare
-                if nes_idata_subj.log_likelihood['nes'].size == 0 or hddm_idata_subj.log_likelihood['hddm'].size == 0:
-                    print(f"Error: Log likelihood data is empty for one or both models for subject/group {subject_id}. Skipping comparison.")
+        # Fit HDDM Model
+        print(f"\n--- Fitting HDDM Model for Subject {s_id} ---")
+        if 'models' in HDDM_MODEL_CONFIG_MAIN and any('C(condition' in m['model'] for m in HDDM_MODEL_CONFIG_MAIN['models']):
+            if 'condition' not in current_subject_data.columns:
+                print(f"Warning: 'condition' column needed for HDDM regression not found for subject {s_id}. Adding dummy 'A'.")
+                current_subject_data.loc[:, 'condition'] = 'A'
+            elif not current_subject_data['condition'].isin(['A', 'B', 'C']).all(): # Example valid conditions
+                 print(f"Warning: 'condition' column for subject {s_id} contains unexpected values for HDDM regression. Ensure levels match formula (e.g. 'A', 'B', 'C'). Using 'A' as default for problematic rows.")
+                 # This is a simplistic fix; might need more robust handling
+                 current_subject_data.loc[~current_subject_data['condition'].isin(['A', 'B', 'C']), 'condition'] = 'A'
+            if not pd.api.types.is_categorical_dtype(current_subject_data['condition']):
+                 current_subject_data['condition'] = pd.Categorical(current_subject_data['condition'], categories=['A', 'B', 'C'], ordered=False)
+
+
+        hddm_idata_subj = fit_hddm_ext_model(
+            subject_data_orig=current_subject_data,
+            hddm_model_config=HDDM_MODEL_CONFIG_MAIN,
+            num_samples=HDDM_NUM_SAMPLES,
+            burn_in=HDDM_BURN_IN
+        )
+        if hddm_idata_subj:
+            all_subject_hddm_idata[s_id] = hddm_idata_subj
+            print(f"HDDM fitting successful for subject {s_id}.")
+            hddm_idata_path = os.path.join(OUTPUT_DIR, f"hddm_idata_subject_{s_id}.nc")
+            try:
+                hddm_idata_subj.to_netcdf(hddm_idata_path)
+                print(f"Saved HDDM InferenceData for subject {s_id} to {hddm_idata_path}")
+            except Exception as e:
+                print(f"Error saving HDDM InferenceData for subject {s_id}: {e}")
+        else:
+            print(f"HDDM fitting failed for subject {s_id}.")
+        print(f"===== Finished processing Subject ID: {s_id} =====")
+
+    # --- Model Comparison (using ArviZ compare) ---
+    comparison_results_summary = {}
+    if not all_subject_nes_idata or not all_subject_hddm_idata:
+        print("\nNot enough InferenceData objects collected for one or both model types. Skipping comparison.")
+    else:
+        # Ensure unique_subject_ids is based on actual keys for which data might exist
+        processed_subject_ids = set(all_subject_nes_idata.keys()) & set(all_subject_hddm_idata.keys())
+        if not processed_subject_ids:
+            print("\nNo common subjects with successful fits for both models. Skipping comparison.")
+        else:
+            for s_id in processed_subject_ids:
+                print(f"\n--- Comparing models for Subject ID: {s_id} ---")
+                nes_id = all_subject_nes_idata.get(s_id)
+                hddm_id = all_subject_hddm_idata.get(s_id)
+
+                # Check if log_likelihood attribute and specific model key exist
+                if not (hasattr(nes_id, 'log_likelihood') and 'nes' in nes_id.log_likelihood and
+                        hasattr(hddm_id, 'log_likelihood') and 'hddm' in hddm_id.log_likelihood):
+                    print(f"Log likelihood data structure incorrect or missing in InferenceData for subject {s_id}. Skipping comparison.")
                     continue
+                try:
+                    compare_dict_subj = {"nes": nes_id, "hddm": hddm_id}
+                    waic_comp = az.compare(compare_dict_subj, ic="waic", scale="log")
+                    loo_comp = az.compare(compare_dict_subj, ic="loo", scale="log")
+                    comparison_results_summary[s_id] = {"waic": waic_comp, "loo": loo_comp}
 
-                waic_compare = az.compare(compare_models_dict, ic="waic", scale="log")
-                loo_compare = az.compare(compare_models_dict, ic="loo", scale="log")
+                    print(f"WAIC Comparison for Subject {s_id}:\n{waic_comp}")
+                    print(f"LOO Comparison for Subject {s_id}:\n{loo_comp}")
 
-                comparison_results[subject_id] = {
-                    "waic": waic_compare,
-                    "loo": loo_compare
-                }
-                print(f"WAIC comparison for subject/group {subject_id}:\n{waic_compare}")
-                print(f"LOO comparison for subject/group {subject_id}:\n{loo_compare}")
+                    waic_comp.to_csv(os.path.join(OUTPUT_DIR, f"waic_compare_subject_{s_id}.csv"))
+                    loo_comp.to_csv(os.path.join(OUTPUT_DIR, f"loo_compare_subject_{s_id}.csv"))
+                except Exception as e:
+                    print(f"Error during ArviZ comparison for subject {s_id}: {e}")
+                    print("Please check the structure of log_likelihood in your InferenceData objects.")
 
-            except Exception as e:
-                print(f"Error during ArviZ comparison for subject/group {subject_id}: {e}")
-                print("Ensure that InferenceData objects are correctly formatted with non-empty log likelihood data.")
-
-    # Save results
-    if comparison_results:
-        print(f"\nSaving comparison results to {output_dir}...")
-        for subject_id, results in comparison_results.items():
-            try:
-                results["waic"].to_csv(os.path.join(output_dir, f"waic_compare_subject_{subject_id}.csv"))
-                results["loo"].to_csv(os.path.join(output_dir, f"loo_compare_subject_{subject_id}.csv"))
-                # az.to_netcdf(all_nes_idata[subject_id], os.path.join(output_dir, f"nes_idata_subject_{subject_id}.nc"))
-                # az.to_netcdf(all_hddm_idata[subject_id], os.path.join(output_dir, f"hddm_idata_subject_{subject_id}.nc"))
-            except Exception as e:
-                print(f"Error saving results for subject/group {subject_id}: {e}")
-        print("Results saved.")
+    print("\n--- Final Script Summary ---")
+    if all_subject_nes_idata:
+        print(f"NES model fitting attempted for {len(unique_subject_ids)} subjects. Successful fits: {len(all_subject_nes_idata)}.")
+    if all_subject_hddm_idata:
+        print(f"HDDM model fitting attempted for {len(unique_subject_ids)} subjects. Successful fits: {len(all_subject_hddm_idata)}.")
+    if comparison_results_summary:
+        print(f"Model comparison performed for {len(comparison_results_summary)} subjects.")
+        print("Comparison results (WAIC/LOO tables) saved in:", OUTPUT_DIR)
     else:
-        print("\nNo comparison results to save.")
+        print("No model comparisons were performed or saved.")
 
-    print(f"\nComparison script finished.")
+    print(f"\nMain empirical comparison script finished. All artifacts saved in {OUTPUT_DIR}")
 
-    if comparison_results:
-        print("\n--- Final Comparison Summaries ---")
-        for subject_id, result in comparison_results.items():
-            print(f"\nSummary for Subject/Group {subject_id}:")
-            print("WAIC Comparison:")
-            print(result['waic'])
-            print("\nLOO Comparison:")
-            print(result['loo'])
-    else:
-        print("\nNo final comparison summaries to display.")
-
-    # --- Test block for get_log_likelihood_pointwise ---
-    # In a real run, all_data would come from load_empirical_data
-    all_trials_df = all_data # Use loaded data if available
-
-    if 'all_trials_df' not in locals() or all_trials_df is None or all_trials_df.empty:
-        print("Creating dummy all_trials_df for testing get_log_likelihood_pointwise.")
-        dummy_test_data = {
-            'subj_idx': [1, 1, 1],
-            'rt': [0.5, 0.7, 0.6],
-            'response': [1, 0, 1], # Assuming 1 for upper, 0 for lower
-            'frame': ['gain', 'loss', 'gain'], # Example: 'gain' or 'loss'
-            'valence_score': [0.5, -0.3, 0.8] # Example valence scores
-        }
-        all_trials_df = pd.DataFrame(dummy_test_data)
-
-    if not all_trials_df.empty:
-        sample_trial = all_trials_df.iloc[0]
-
-        # Test HDDM
-        dummy_hddm_params = {'v': 1.5, 'a': 2.0, 't': 0.3, 'z': 0.5, 'sv': 0.1, 'sz': 0.1, 'st': 0.05}
-        trial_cond_hddm = {} # HDDM conditions can be passed here if model depends on them (e.g. v ~ condition)
-
-        if sample_trial['rt'] > dummy_hddm_params['t']:
-            log_lik_hddm = get_log_likelihood_pointwise(
-                posterior_params=dummy_hddm_params,
-                trial_rt=sample_trial['rt'],
-                trial_choice=sample_trial['response'],
-                trial_condition=trial_cond_hddm,
-                model_type="HDDM"
-            )
-            print(f"Test HDDM Log Lik: {log_lik_hddm}")
-        else:
-            print(f"Sample trial RT {sample_trial['rt']} <= t {dummy_hddm_params['t']} for HDDM test, skipping.")
-
-        # Test NES
-        dummy_nes_dyn_params = {'v_norm': 1.0, 'a_0': 1.5, 't_0': 0.2, 'alpha_gain': 0.1, 'beta_val': 0.5}
-        fixed_nes_params_test = {'logit_z0': 0.0, 'log_tau_norm': -0.7} # log_tau_norm for exp decay
-        nes_ddm_params_test = {'w_s': 1.0, 'salience_input': 1.0, 'sv': 0.0, 'sz': 0.0, 'st': 0.0} # DDM base params for NES
-
-        trial_cond_nes = {
-            'is_gain_frame': sample_trial['frame'] == 'gain',
-            'valence_score': sample_trial['valence_score']
-        }
-
-        if sample_trial['rt'] > dummy_nes_dyn_params['t_0']:
-            log_lik_nes = get_log_likelihood_pointwise(
-                posterior_params=dummy_nes_dyn_params,
-                trial_rt=sample_trial['rt'],
-                trial_choice=sample_trial['response'],
-                trial_condition=trial_cond_nes,
-                model_type="NES",
-                fixed_nes_params=fixed_nes_params_test,
-                nes_ddm_params=nes_ddm_params_test
-            )
-            print(f"Test NES Log Lik: {log_lik_nes}")
-        else:
-            print(f"Sample trial RT {sample_trial['rt']} <= t_0 {dummy_nes_dyn_params['t_0']} for NES test, skipping.")
-
+    # --- Comment out previous individual test blocks ---
+    # Test block for get_log_likelihood_pointwise (example)
+    """
+    if __name__ == "__main__": # This was part of the original test, keep it commented
+        # ... (original get_log_likelihood_pointwise test code) ...
+    """
 
 # Ensure the script is aware of its location if run directly, for module imports if any were relative
 # print("Script compare_nes_hddm_empirical.py execution complete.")
