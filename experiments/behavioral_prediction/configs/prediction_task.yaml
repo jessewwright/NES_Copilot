@@ -1,8 +1,19 @@
-agent_type: BOTH
-ws: 1.0
-wn: 1.0
+agent_type: BOTH # Default, will be overridden by batch script for each run's specific call if needed
+ws: 1.0           # Default, will be overridden by batch script
+wn: 1.0           # Default, will be overridden by batch script
 n_trials_per_lambda: 100
-lambdas: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-seed: 20231031
-reward_A: 1.0
-reward_B: 1.0
+lambdas:
+  - 0.0
+  - 0.1
+  - 0.2
+  - 0.3
+  - 0.4
+  - 0.5
+  - 0.6
+  - 0.7
+  - 0.8
+  - 0.9
+  - 1.0
+seed: 424242      # Fixed base seed for the entire batch's reproducibility
+reward_A: 1.0     # Default, will be overridden by batch script
+reward_B: 1.0     # Default, will be overridden by batch script

@@ -196,3 +196,6 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# Ignore outputs from behavioral prediction simulation
+experiments/behavioral_prediction/outputs/
