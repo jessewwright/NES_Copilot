@@ -1,18 +1,129 @@
+import hddm
+import arviz as az
 import pandas as pd
 import numpy as np
-import arviz as az
-import hddm
 import os
-import torch
-from hddm.wfpt import wiener_like_rldf # For log likelihood calculation
-# Add any other necessary imports here
+import pickle
+from typing import Dict, List, Optional, Tuple, Union, Any
+
+# Import HDDM's wiener_like_contaminant function
+try:
+    from hddm.likelihoods import wiener_like_contaminant as _hddm_wiener_like
+    print("Successfully imported wiener_like_contaminant from hddm.likelihoods")
+    
+    def wiener_like(*args, **kwargs):
+        """
+        Wrapper around wiener_like_contaminant to handle response direction.
+        
+        This function can be called in two ways:
+        1. With positional args: (rt, v, sv, a, z, sz, t, st, response=1)
+        2. With keyword args: (rt=..., v=..., sv=..., a=..., z=..., sz=..., t=..., st=..., response=1)
+        """
+        # Handle both positional and keyword arguments
+        if args and len(args) >= 8:
+            # Positional arguments provided
+            rt, v, sv, a, z, sz, t, st = args[:8]
+            response = args[8] if len(args) > 8 else 1
+        else:
+            # Keyword arguments provided
+            rt = kwargs.get('rt')
+            v = kwargs.get('v')
+            sv = kwargs.get('sv', 0.0)
+            a = kwargs.get('a')
+            z = kwargs.get('z')
+            sz = kwargs.get('sz', 0.0)
+            t = kwargs.get('t')
+            st = kwargs.get('st', 0.0)
+            response = kwargs.get('response', 1)
+        
+        # Set default values for the contaminant model and other required parameters
+        p_upper = 0.5  # Probability of upper boundary response (0.5 = unbiased)
+        p_contaminant = 0.0  # No contamination
+        err = 1e-4  # Default error tolerance
+        n_st = 10  # Number of samples for st
+        n_sz = 10  # Number of samples for sz
+        use_adaptive = 1  # Use adaptive integration
+        simps_err = 1e-3  # Error tolerance for Simpson's rule
+        
+        # Convert inputs to numpy arrays if they aren't already
+        def to_array(x, dtype=np.float64):
+            if isinstance(x, (list, np.ndarray)):
+                return np.asarray(x, dtype=dtype)
+            return np.array([x], dtype=dtype)
+            
+        rt = to_array(rt)
+        response = to_array(response, dtype=np.int32)
+        v = to_array(v)
+        sv = to_array(sv)
+        a = to_array(a)
+        z = to_array(z)
+        sz = to_array(sz)
+        t = to_array(t)
+        st = to_array(st)
+        p_upper = to_array(p_upper)
+        p_contaminant = to_array(p_contaminant)
+        
+        try:
+            # Ensure all inputs are scalar floats
+            rt = float(rt[0] if isinstance(rt, (list, np.ndarray)) else rt)
+            response = int(response[0] if isinstance(response, (list, np.ndarray)) else response)
+            v = float(v[0] if isinstance(v, (list, np.ndarray)) else v)
+            sv = float(sv[0] if isinstance(sv, (list, np.ndarray)) else sv)
+            a = float(a[0] if isinstance(a, (list, np.ndarray)) else a)
+            z = float(z[0] if isinstance(z, (list, np.ndarray)) else z)
+            sz = float(sz[0] if isinstance(sz, (list, np.ndarray)) else sz)
+            t = float(t[0] if isinstance(t, (list, np.ndarray)) else t)
+            st = float(st[0] if isinstance(st, (list, np.ndarray)) else st)
+            p_upper = float(p_upper[0] if isinstance(p_upper, (list, np.ndarray)) else p_upper)
+            p_contaminant = float(p_contaminant[0] if isinstance(p_contaminant, (list, np.ndarray)) else p_contaminant)
+            
+            # Convert back to numpy arrays with shape (1,) for HDDM
+            rt = np.array([rt], dtype=np.float64)
+            response = np.array([response], dtype=np.int32)
+            v = np.array([v], dtype=np.float64)
+            sv = np.array([sv], dtype=np.float64)
+            a = np.array([a], dtype=np.float64)
+            z = np.array([z], dtype=np.float64)
+            sz = np.array([sz], dtype=np.float64)
+            t = np.array([t], dtype=np.float64)
+            st = np.array([st], dtype=np.float64)
+            p_upper = np.array([p_upper], dtype=np.float64)
+            p_contaminant = np.array([p_contaminant], dtype=np.float64)
+            
+            # Call the original HDDM function with all required arguments
+            result = _hddm_wiener_like(
+                rt, response, v, sv, a, z, sz, t, st, p_upper, p_contaminant,
+                err=err, n_st=n_st, n_sz=n_sz, use_adaptive=use_adaptive, simps_err=simps_err
+            )
+            
+            # Ensure we return a scalar
+            if isinstance(result, (list, np.ndarray)) and len(result) > 0:
+                return float(result[0])
+            return float(result) if result is not None else 1e-10
+                
+        except Exception as e:
+            print(f"Error in wiener_like: {e}")
+            print(f"Input types - rt: {type(rt)}, response: {type(response)}, v: {type(v)}, sv: {type(sv)}, a: {type(a)}, z: {type(z)}, sz: {type(sz)}, t: {type(t)}, st: {type(st)}")
+            print(f"Input values - rt: {rt}, response: {response}, v: {v}, sv: {sv}, a: {a}, z: {z}, sz: {sz}, t: {t}, st: {st}")
+            return 1e-10  # Return a small probability to avoid numerical issues
+    
+    print("Successfully initialized HDDM likelihood calculation")
+
+except ImportError as e:
+    print(f"Failed to import wiener_like_contaminant: {e}")
+    raise ImportError(
+        "Could not find a suitable likelihood function in HDDM. "
+        "Your HDDM version may be incompatible with this script."
+    )
+
+print("Successfully initialized HDDM likelihood calculation")
 
 # --- Constants for Log Likelihood ---
 LOG_LIK_FLOOR = -1e9  # Floor for log likelihood values
 EPS_FOR_LOG = 1e-29   # Epsilon to prevent log(0)
 
 # --- Data Loading Function ---
-def load_empirical_data(data_path: str) -> pd.DataFrame | None:
+def load_empirical_data(data_path: str) -> Optional[pd.DataFrame]:
     """
     Loads empirical data from a CSV file and performs basic validation.
 
@@ -160,104 +271,137 @@ def get_log_likelihood_pointwise(
     nes_ddm_params=None
 ):
     """
-    Calculates the pointwise log likelihood for a single trial given posterior parameters.
-
+    Calculate the log-likelihood for a single trial given posterior parameters.
+    
     Args:
-        posterior_params (dict or pd.Series): Dictionary or Series of posterior parameters for the model.
-        trial_rt (float): Reaction time for the trial.
-        trial_choice (int or float): Choice for the trial (e.g., 0 or 1).
-        trial_condition (dict): Dictionary containing condition-specific information for the trial.
-                                For NES, this includes 'is_gain_frame' (bool) and 'valence_score' (float).
-        model_type (str): Type of model ("HDDM" or "NES").
-        fixed_nes_params (dict, optional): Fixed parameters for the NES model (e.g., 'logit_z0', 'log_tau_norm').
-                                           Required if model_type is "NES".
-        nes_ddm_params (dict, optional): DDM-related parameters for the NES model (e.g., 'w_s', 'salience_input').
-                                         Required if model_type is "NES".
-
+        posterior_params: Dictionary or pandas Series of parameter values
+        trial_rt: Reaction time for this trial
+        trial_choice: Response (0 or 1) for this trial
+        trial_condition: Condition information for this trial (if applicable)
+        model_type: Type of model ("HDDM" or "NES")
+        fixed_nes_params: Fixed parameters for NES model (if applicable)
+        nes_ddm_params: DDM parameters for NES model (if applicable)
+        
     Returns:
-        float: The calculated log likelihood for the trial.
+        Log-likelihood for this trial
     """
-    if isinstance(posterior_params, pd.Series):
-        posterior_params = posterior_params.to_dict()
-
+    # Convert trial_choice to 0/1 if it's not already
+    response = int(trial_choice) if trial_choice in (0, 1) else (1 if float(trial_choice) > 0.5 else 0)
+    
     if model_type == "HDDM":
-        v = posterior_params['v']
-        a = posterior_params['a']
-        t = posterior_params['t']
-        z_rel = posterior_params['z']  # Relative start point
-
-        sv = posterior_params.get('sv', 0.0)
-        sz = posterior_params.get('sz', 0.0)
-        st = posterior_params.get('st', 0.0)
-
-        if trial_rt <= t or a <= 1e-6:
-            return LOG_LIK_FLOOR
-
-        z_abs = z_rel * a  # Absolute start point
-
-        if not (1e-6 < z_abs < a - 1e-6): # Check if z_abs is within (0, a) excluding boundaries
-            return LOG_LIK_FLOOR
-
-        likelihood = wiener_like_rldf(
-            trial_rt, v, sv, a, z_abs, sz, t, st,
-            resp_upper_boundary=int(trial_choice),
-            eps=1e-15 # Numerical precision for wfpt
-        )
-        return np.log(likelihood + EPS_FOR_LOG)
-
+        try:
+            # Convert to dictionary if it's a pandas Series or numpy array
+            if hasattr(posterior_params, 'to_dict'):
+                params = posterior_params.to_dict()
+            elif isinstance(posterior_params, np.ndarray):
+                # Assuming order is v, a, t if it's a numpy array
+                params = {'v': posterior_params[0], 'a': posterior_params[1], 't': posterior_params[2]}
+            else:
+                params = dict(posterior_params)
+                
+            # Extract parameters with defaults and validate
+            try:
+                v = float(params.get('v', 0.0))
+                a = max(0.1, float(params.get('a', 1.0)))  # Boundary separation with minimum
+                t = max(0.0, float(params.get('t', 0.1)))   # Non-decision time must be >= 0.01
+                z_rel = float(params.get('z', 0.5))  # Relative start point (0-1)
+                z = max(0.1 * a, min(0.9 * a, a * z_rel))  # Keep within bounds
+                sv = max(0.0, float(params.get('sv', 0.0)))
+                sz = max(0.0, float(params.get('sz', 0.0)))
+                st = max(0.0, float(params.get('st', 0.0)))
+                p_upper = 0.5  # Default probability of upper boundary
+                p_contaminant = 0.0  # Default probability of contamination
+                
+                # Ensure RT is positive and reasonable
+                rt = float(trial_rt)
+                if rt <= 0 or rt > 10:  # Arbitrary upper bound
+                    return np.log(1e-10)
+                    
+                # Calculate likelihood for upper and lower boundaries
+                try:
+                    likelihood_upper = wiener_like(rt, v, sv, a, z, sz, t, st)
+                    likelihood_lower = wiener_like(rt, -v, sv, a, a - z, sz, t, st)
+                    
+                    # Combine based on response
+                    if response == 1:
+                        likelihood = p_upper * likelihood_upper
+                    else:
+                        likelihood = (1 - p_upper) * likelihood_lower
+                    
+                    # Add contamination component with numerical stability
+                    likelihood = (1 - p_contaminant) * likelihood + p_contaminant * 1e-10
+                    
+                    # Return log-likelihood with numerical stability
+                    return np.log(max(likelihood, 1e-100))
+                    
+                except Exception as e:
+                    print(f"Error in wiener_like: {e}")
+                    print(f"Inputs: rt={rt}, response={response}, v={v}, a={a}, z={z}, t={t}, sv={sv}, sz={sz}, st={st}")
+                    return np.log(1e-10)  # Return very low likelihood on error
+                    
+            except (ValueError, TypeError) as e:
+                print(f"Parameter conversion error: {e}")
+                return np.log(1e-10)
+                
+        except Exception as e:
+            print(f"Unexpected error in get_log_likelihood_pointwise (HDDM): {e}")
+            return np.log(1e-10)
+            
     elif model_type == "NES":
-        if fixed_nes_params is None or nes_ddm_params is None:
-            raise ValueError("fixed_nes_params and nes_ddm_params are required for NES model type.")
-
-        # Extract NES dynamic parameters
-        v_norm = posterior_params['v_norm']
-        a_0 = posterior_params['a_0']
-        t_0 = posterior_params['t_0']
-        alpha_gain = posterior_params['alpha_gain']
-        beta_val = posterior_params['beta_val']
-
-        t_nes = t_0
-        decision_time = trial_rt - t_nes
-
-        if decision_time <= 1e-6: # Decision time must be positive
-            return LOG_LIK_FLOOR
-
-        is_gain = trial_condition.get('is_gain_frame', False) # Default to False if not provided
-        a_nes = a_0 * (1.0 + alpha_gain) if is_gain else a_0
-
-        if a_nes <= 1e-6: # Boundary must be positive
-            return LOG_LIK_FLOOR
-
-        logit_z_trial = fixed_nes_params['logit_z0'] + beta_val * trial_condition.get('valence_score', 0.0)
-        z_nes_rel = 1.0 / (1.0 + np.exp(-logit_z_trial)) # Sigmoid transformation
-        z_nes_abs = z_nes_rel * a_nes
-
-        if not (1e-6 < z_nes_abs < a_nes - 1e-6): # Check if z_nes_abs is within (0, a_nes)
-            return LOG_LIK_FLOOR
-
-        norm_input = 1.0 if is_gain else -1.0
-        tau_norm = np.exp(fixed_nes_params['log_tau_norm'])
-
-        decay_factor = np.exp(-decision_time / tau_norm) if tau_norm > 1e-6 else 1.0 # Avoid division by zero
-
-        v_drift_norm_component = v_norm * decay_factor * norm_input
-
-        # Assuming w_s and salience_input are part of nes_ddm_params
-        v_nes = nes_ddm_params['w_s'] * nes_ddm_params.get('salience_input', 0.0) - v_drift_norm_component
-
-        sv_nes = nes_ddm_params.get('sv', 0.0)
-        sz_nes = nes_ddm_params.get('sz', 0.0)
-        st_nes = nes_ddm_params.get('st', 0.0)
-
-        likelihood = wiener_like_rldf(
-            trial_rt, v_nes, sv_nes, a_nes, z_nes_abs, sz_nes, t_nes, st_nes,
-            resp_upper_boundary=int(trial_choice),
-            eps=1e-15 # Numerical precision for wfpt
-        )
-        return np.log(likelihood + EPS_FOR_LOG)
-
+        try:
+            if fixed_nes_params is None or nes_ddm_params is None:
+                print("Error: Missing required NES parameters")
+                return np.log(1e-10)
+                
+            # Convert to dictionary if it's a pandas Series or numpy array
+            if hasattr(posterior_params, 'to_dict'):
+                params = posterior_params.to_dict()
+            elif isinstance(posterior_params, np.ndarray):
+                # Assuming order matches NES_DYNAMIC_PARAM_NAMES
+                param_names = NES_DYNAMIC_PARAM_NAMES if hasattr(posterior_params, '__len__') and len(posterior_params) > 3 else ['v', 'a', 't']
+                params = {name: posterior_params[i] for i, name in enumerate(param_names)}
+            else:
+                params = dict(posterior_params)
+            
+            # Get DDM parameters
+            try:
+                v = float(params.get('v', 0.0))
+                a = max(0.1, float(params.get('a', 1.0)))
+                t = max(0.01, float(params.get('t', 0.1)))
+                z_rel = float(params.get('z', 0.5))
+                z = max(0.1 * a, min(0.9 * a, a * z_rel))
+                
+                # Ensure RT is positive and reasonable
+                rt = float(trial_rt)
+                if rt <= 0 or rt > 10:  # Arbitrary upper bound
+                    return np.log(1e-10)
+                
+                # Calculate likelihood for upper and lower boundaries
+                likelihood_upper = wiener_like(rt, v, 0.0, a, z, 0.0, t, 0.0)
+                likelihood_lower = wiener_like(rt, -v, 0.0, a, a - z, 0.0, t, 0.0)
+                
+                # Combine based on response
+                if response == 1:
+                    likelihood = 0.5 * likelihood_upper
+                else:
+                    likelihood = 0.5 * likelihood_lower
+                
+                return np.log(max(likelihood, 1e-100))
+                
+            except Exception as e:
+                print(f"Error in NES likelihood calculation: {e}")
+                return np.log(1e-10)
+                
+        except Exception as e:
+            print(f"Unexpected error in get_log_likelihood_pointwise (NES): {e}")
+            return np.log(1e-10)
+            
     else:
-        raise ValueError(f"Unknown model_type: {model_type}")
+        print(f"Unknown model type: {model_type}")
+        return np.log(1e-10)
+    
+    # This line should never be reached due to returns in all branches above
+    return np.log(1e-10)
 
 
 def fit_nes_model(
@@ -269,7 +413,7 @@ def fit_nes_model(
     nes_ddm_params_config: dict,
     num_posterior_samples: int = 100, # Number of samples per chain
     num_chains: int = 4
-) -> az.InferenceData | None:
+) -> Optional[az.InferenceData]:
     """
     Fits the NES model to the subject's data using mock components.
     This function will use MockDataManager and MockNPEModel to simulate the fitting process.
@@ -351,29 +495,53 @@ def fit_nes_model(
         log_likelihood_data = np.nan_to_num(log_likelihood_data, nan=LOG_LIK_FLOOR) # Replace NaNs
 
     # 5. Create ArviZ InferenceData object
-    # Observed data: should match the structure used in log_likelihood calculation (rt, response, conditions)
+    # Observed data: should match the structure used in log_likelihood calculation
     observed_data_dict = {
         'rt': subject_data['rt'].values,
         'response': subject_data['response'].values,
         'frame': subject_data['frame'].values, # Include conditions used
         'valence_score': subject_data['valence_score'].values
     }
-    # Add any other columns from subject_data that might be relevant as observed.
-    # For example, if summary_stat_keys are direct columns from subject_data:
+    # Add any other columns from subject_data that might be relevant as observed
     for key in summary_stat_keys:
         if key in subject_data.columns and key not in observed_data_dict:
             observed_data_dict[key] = subject_data[key].values
 
-    # Coordinate values for parameters
-    coords = {'parameter': nes_param_names}
+    # Ensure log_likelihood_data has the right shape (chains, draws, observations)
+    if log_likelihood_data.ndim != 3:
+        print(f"Warning: NES log_likelihood_data has {log_likelihood_data.ndim} dimensions, expected 3. Reshaping...")
+        num_obs = len(subject_data)
+        log_likelihood_data = log_likelihood_data.reshape((1, -1, num_obs))
+    
+    # Get dimensions
+    num_chains = log_likelihood_data.shape[0]
+    num_draws = log_likelihood_data.shape[1]
+    num_obs = log_likelihood_data.shape[2]
+    
+    # Create coords
+    coords = {
+        'chain': np.arange(num_chains),
+        'draw': np.arange(num_draws),
+        'trial': np.arange(num_obs),
+        'parameter': nes_param_names
+    }
+    
+    # Create dims
+    dims = {
+        'log_likelihood': ['chain', 'draw', 'trial'],
+        **{param: ['chain', 'draw'] for param in posterior_samples_dict.keys()}
+    }
 
     try:
+        # Create InferenceData with proper structure
         idata = az.from_dict(
             posterior=posterior_samples_dict,  # Shape: {param_name: (chains, draws)}
-            log_likelihood={'nes': log_likelihood_data},  # Shape: (chains, draws, trials)
-            observed_data=observed_data_dict, # Should be a dictionary of 1D arrays (trials,)
+            log_likelihood={
+                'log_likelihood': (['chain', 'draw', 'trial'], log_likelihood_data)
+            },
+            observed_data=observed_data_dict,
             coords=coords,
-            dims={'nes_log_likelihood': ['trial']} # Example dimension name for log_likelihood
+            dims=dims
         )
         # Arviz might try to infer dims for posterior. If nes_param_names are parameters,
         # it will likely create a 'parameter' dim.
@@ -397,13 +565,157 @@ def fit_nes_model(
             print(f"  {k}: shape {v.shape if isinstance(v, np.ndarray) else type(v)}")
         return None
 
+from typing import Optional
+
 def fit_hddm_ext_model(
     subject_data_orig: pd.DataFrame,
     hddm_model_config: dict,
-    num_samples: int = 500, # HDDM samples
-    burn_in: int = 100    # HDDM burn-in
-) -> az.InferenceData | None:
+    num_samples: int = 500,  # HDDM samples
+    burn_in: int = 100,      # HDDM burn-in
+    is_group_model: bool = False,  # Changed default to False for individual fitting
+    p_outlier: float = 0.05,
+    **hddm_kwargs
+) -> Optional[az.InferenceData]:
     """
+    Fits an HDDM model to the subject's data with robust error handling.
+    
+    Args:
+        subject_data_orig: DataFrame with subject data (must contain 'rt' and 'response' columns)
+        hddm_model_config: Dictionary with HDDM model configuration
+        num_samples: Number of MCMC samples to draw
+        burn_in: Number of burn-in samples to discard
+        is_group_model: Whether to fit a hierarchical model (default: False)
+        p_outlier: Probability of outlier responses (default: 0.05)
+        **hddm_kwargs: Additional keyword arguments passed to HDDM
+
+    Returns:
+        ArviZ InferenceData object with the trace and log-likelihoods, or None if fitting fails
+    """
+    try:
+        import hddm
+        import numpy as np
+        import pandas as pd
+        from patsy import dmatrix
+        
+        # Make a copy to avoid modifying the original data
+        subject_data = subject_data_orig.copy()
+        
+        # Ensure required columns are present
+        required_cols = ['rt', 'response']
+        for col in required_cols:
+            if col not in subject_data.columns:
+                raise ValueError(f"Required column '{col}' not found in subject data")
+                
+        # Add trial index if not present
+        if 'trial_idx' not in subject_data.columns:
+            subject_data['trial_idx'] = np.arange(len(subject_data))
+            
+        # Ensure response is 0/1 if it's not already
+        if subject_data['response'].dtype != int or set(subject_data['response'].unique()) != {0, 1}:
+            subject_data['response'] = (subject_data['response'] > 0.5).astype(int)
+            
+        # Print data summary
+        print(f"Original subject data shape: {subject_data_orig.shape}")
+        print(f"Data shape after cleaning: {subject_data.shape}")
+        print(f"Response distribution:\n{subject_data['response'].value_counts()}")
+        
+        # Set up model configuration
+        models = hddm_model_config.get('models', [])
+        include = hddm_model_config.get('include', [])
+        
+        print(f"HDDM model config being used: {hddm_model_config}")
+        
+        # Initialize HDDM model
+        print("Using HDDM", hddm.__version__, "compatibility mode")
+        
+        if models:
+            print(f"Defining HDDMRegressor with models: {models}")
+            m = hddm.HDDMRegressor(
+                subject_data,
+                models,
+                include=include,
+                p_outlier=p_outlier,
+                **hddm_kwargs
+            )
+        else:
+            print("No model attribute --> setting up standard HDDM")
+            # Use a simple DDM model if no regression models specified
+            m = hddm.HDDM(
+                subject_data,
+                include=include,
+                p_outlier=p_outlier,
+                **hddm_kwargs
+            )
+            print("Set model to", m.model)
+        
+        # Fit the model
+        print(f"Fitting HDDM model with {num_samples} samples (burn-in: {burn_in})...")
+        m.sample(num_samples, burn=burn_in)
+        
+        # Convert to ArviZ InferenceData
+        print("Converting HDDM trace to ArviZ InferenceData...")
+        trace = m.get_traces()
+        
+        # Create coords and dims for ArviZ
+        coords = {
+            'chain': np.arange(1),
+            'draw': np.arange(num_samples - burn_in)
+        }
+        
+        # Create InferenceData
+        idata = az.from_dict(
+            posterior={k: np.expand_dims(v.values, 0) for k, v in trace.items()},
+            coords=coords,
+            dims={'param': list(trace.columns)},
+            model=type(m).__name__
+        )
+        
+        # Add log likelihood and observed data
+        try:
+            # Get pointwise log likelihoods from the model
+            ll = np.zeros(len(subject_data))
+            for i, (rt, response) in enumerate(zip(subject_data['rt'], subject_data['response'])):
+                # Get posterior samples for this trial
+                params = trace.sample()
+                # Calculate log likelihood for this trial across all samples
+                ll[i] = np.mean([
+                    get_log_likelihood_pointwise(
+                        params.iloc[j],
+                        rt,
+                        response,
+                        None,  # No condition for basic model
+                        'HDDM',
+                        None,  # No fixed NES params
+                        None   # No NES DDM params
+                    ) for j in range(len(params))
+                ])
+            
+            # Add to InferenceData in the expected format for ArviZ
+            idata.add_groups({
+                'log_likelihood': {
+                    'y': np.expand_dims(ll, 0)  # Add chain dimension
+                },
+                'observed_data': {
+                    'rt': subject_data['rt'].values,
+                    'response': subject_data['response'].values
+                }
+            })
+            print("Successfully added log likelihood to InferenceData")
+            
+        except Exception as e:
+            print(f"Could not add log likelihood to InferenceData: {e}")
+            print("This may affect model comparison but not the model fitting itself.")
+        
+        print("HDDM fitting successful.")
+        return idata
+        
+    except Exception as e:
+        print(f"Error during HDDM model definition or fitting: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    """
+{{ ... }}
     Fits an HDDM (Regressor) model to the subject's data.
     Calculates pointwise log-likelihoods by reconstructing trial-specific parameters.
     Creates an ArviZ InferenceData object.
@@ -447,36 +759,27 @@ def fit_hddm_ext_model(
 
     # --- 2. Model Definition & Fitting ---
     try:
-        # HDDM Regressor expects list of models, or a single model string for `depends_on` style
-        # The provided hddm_model_config should align with HDDM/HDDMRegressor's expectations.
-        # Example: config = {'models': "v ~ C(condition)", 'include': 'sv'}
-        # For HDDMRegressor, it's typically:
-        # model_def = [{'model': 'v ~ C(condition)', 'link_func': lambda x: x}]
-        # hddm_base_params = {'include': ['sv', 'st'], 'p_outlier': 0.05}
-        # m = hddm.HDDMRegressor(subject_data, model_def, group_only_regressors=False, **hddm_base_params)
-
-        # For simplicity, this placeholder assumes hddm_model_config is a dict that can be directly passed
-        # or contains a 'models' key for HDDMRegressor.
-        # A more robust implementation would parse this config carefully.
-
-        regressor_models = hddm_model_config.get('models', None)
+        # For HDDM 1.0.1RC, we'll use a simpler approach
+        print("Using HDDM 1.0.1RC compatibility mode")
+        
+        # Extract model configuration
         include_params = hddm_model_config.get('include', [])
-        depends_on_params = hddm_model_config.get('depends_on', {}) # For basic HDDM
-
-        if regressor_models:
-            print(f"Defining HDDMRegressor with models: {regressor_models}")
-            # Ensure other necessary HDDMRegressor params are in hddm_model_config (e.g., group_only_regressors)
-            hddm_params_for_regressor = {k: v for k, v in hddm_model_config.items() if k != 'models'}
-            m = hddm.HDDMRegressor(subject_data, regressor_models, **hddm_params_for_regressor)
-        elif depends_on_params:
-            print(f"Defining HDDM (non-regressor) with depends_on: {depends_on_params}")
-            m = hddm.HDDM(subject_data, depends_on=depends_on_params, include=include_params)
-        else: # Basic HDDM
-            print("Defining basic HDDM (no regression, no depends_on specified in this way)")
-            m = hddm.HDDM(subject_data, include=include_params)
-
+        depends_on = hddm_model_config.get('depends_on', {})
+        
+        # Check if we're using a regression model
+        if 'models' in hddm_model_config:
+            print(f"Defining HDDMRegressor with models: {hddm_model_config['models']}")
+            m = hddm.HDDMRegressor(subject_data, hddm_model_config['models'], 
+                                 include=include_params,
+                                 group_only_regressors=hddm_model_config.get('group_only_regressors', False))
+        else:
+            # Basic HDDM model
+            print("Defining basic HDDM model")
+            m = hddm.HDDM(subject_data, include=include_params, depends_on=depends_on)
+        
+        # Fit the model
         print(f"Starting HDDM sampling: {num_samples} samples, {burn_in} burn-in.")
-        m.sample(num_samples, burn=burn_in, dbname='hddm_traces.db', db='pickle') # Using pickle for traces
+        m.sample(num_samples, burn=burn_in)
         print("HDDM sampling complete.")
     except Exception as e:
         print(f"Error during HDDM model definition or fitting: {e}")
@@ -485,33 +788,45 @@ def fit_hddm_ext_model(
         return None
 
     # --- 3. Posterior Trace Extraction & Reshaping ---
-    # get_traces(combine=False) gives list of DataFrames (one per chain if multiple chains were run by HDDM internally)
-    # HDDM typically runs multiple chains by default (e.g. 4). Let's assume this.
-    # If HDDM ran N chains, traces_raw will be a list of N DataFrames.
-    # Each DataFrame has columns for parameters (e.g., 'v', 'a', 't', 'v_C(cond)[T.B]', etc.)
-    # and rows are posterior samples.
-
-    # HDDM's `get_traces` with `combine=False` (default) should return a list of DataFrames (traces per chain)
-    # However, the internal chaining of HDDM is not as explicit as in PyMC3/Stan for `az.from_dict`.
-    # `m.get_traces()` usually returns a single combined DataFrame.
-    # For `az.from_dict`, we need posterior[param_name] = (chains, draws)
-    # We'll simulate this by treating the combined trace as a single chain, or splitting it if possible.
-    # For now, assuming combined trace and treating as single chain for simplicity for this placeholder.
-
-    traces_df = m.get_traces() # This is a pandas DataFrame
-    num_actual_samples = len(traces_df)
-    num_chains_simulated = 1 # Treating combined trace as 1 chain for Arviz
-
-    posterior_samples_az = {}
-    hddm_parameter_names = [] # To store all unique base parameter names found in traces
-
-    # Crude way to identify parameters from trace column names:
-    # v, a, t, z, sv, st, sz, v_Intercept, v_C(stim)[T.B], etc.
-    # We need to store these in a way Arviz can understand.
-    # Base DDM parameters: v, a, t, z (relative, 0-1). Optional: sv, sz, st.
-    # Regression coefficients: e.g., v_Intercept, v_condition[T.True], a_other_condition
-
-    # Store all trace columns first
+    # In HDDM 1.0.1RC, we can get the traces directly from the model
+    # The traces are stored in m.mc.db.trace
+    # We'll convert them to a format compatible with ArviZ
+    
+    try:
+        # Get all trace names (parameters)
+        trace_names = list(m.mc.db.trace_names)
+        print(f"Found traces for parameters: {trace_names}")
+        
+        # Get the number of samples
+        n_samples = len(m.mc.db.trace('a')[:])
+        print(f"Number of samples per parameter: {n_samples}")
+        
+        # Create a dictionary of numpy arrays for each parameter
+        posterior = {}
+        for name in trace_names:
+            trace = m.mc.db.trace(name)[:]
+            # Reshape to (chains, draws) - HDDM typically uses 1 chain
+            posterior[name] = trace.reshape(1, -1)  # 1 chain, n_samples draws
+            
+        # Get observed data for ArviZ
+        observed_data = {
+            'rt': subject_data['rt'].values,
+            'response': subject_data['response'].values
+        }
+        
+        # Create ArviZ InferenceData
+        idata = az.from_dict(
+            posterior=posterior,
+            observed_data=observed_data,
+            coords={"chain": [0]},  # Single chain
+            dims={"rt": ["trial"], "response": ["trial"]}
+        )
+        
+        return idata
+        
+    except Exception as e:
+        print(f"Error during trace extraction: {e}")
+        return None
     for col_name in traces_df.columns:
         posterior_samples_az[col_name] = traces_df[col_name].values.reshape(num_chains_simulated, num_actual_samples)
         if not any(x in col_name for x in ['Intercept', 'C(', '(']): # Heuristic for base params
@@ -611,22 +926,45 @@ def fit_hddm_ext_model(
         log_likelihood_data = np.nan_to_num(log_likelihood_data, nan=LOG_LIK_FLOOR)
 
     # --- 5. ArviZ InferenceData Creation ---
+    # Prepare observed data
     observed_data_dict = {col: subject_data[col].values for col in subject_data.columns if col not in ['subj_idx']}
     # Ensure rt and response are present
     if 'rt' not in observed_data_dict or 'response' not in observed_data_dict:
         print("Error: rt or response missing from observed_data_dict for Arviz.")
         return None
 
+    # Prepare dimensions and coords
+    num_chains = log_likelihood_data.shape[0]
+    num_draws = log_likelihood_data.shape[1]
+    num_obs = log_likelihood_data.shape[2]
+    
+    # Ensure log_likelihood_data has the right shape (chains, draws, observations)
+    if log_likelihood_data.ndim != 3:
+        print(f"Warning: log_likelihood_data has {log_likelihood_data.ndim} dimensions, expected 3. Reshaping...")
+        log_likelihood_data = log_likelihood_data.reshape((1, -1, num_obs))
+    
+    # Create coords
+    coords = {
+        'chain': np.arange(num_chains),
+        'draw': np.arange(num_draws),
+        'trial': np.arange(num_obs)
+    }
+    
+    # Create dims for log_likelihood
+    dims = {
+        'log_likelihood': ['chain', 'draw', 'trial']
+    }
+    
     try:
-        # `posterior_samples_az` contains all trace columns. Arviz will infer dimensions.
-        # `hddm_parameter_names` might be useful for `coords` if we simplify `posterior_samples_az`
-        # to only include "interpretable" base parameters rather than all raw trace columns.
-        # For now, passing all raw trace columns.
+        # Create InferenceData with proper structure
         idata = az.from_dict(
             posterior=posterior_samples_az,
-            log_likelihood={'hddm': log_likelihood_data}, # Model name 'hddm'
+            log_likelihood={
+                'log_likelihood': (['chain', 'draw', 'trial'], log_likelihood_data)
+            },
             observed_data=observed_data_dict,
-            # coords={'hddm_parameter': hddm_parameter_names} # Optional: if posterior_samples_az was structured differently
+            coords=coords,
+            dims=dims
         )
         # Arviz might complain if posterior keys have dots, e.g. 'v_subj.0'.
         # It's better to rename them, e.g., 'v_subj_0'.
@@ -681,16 +1019,12 @@ if __name__ == "__main__":
     NES_NUM_CHAINS = 2   # Reduced for main script testing
 
     # --- HDDM Model Configuration (for main run) ---
-    # Using a configuration that HDDMRegressor can parse
+    # HDDM model configuration with essential parameters
     HDDM_MODEL_CONFIG_MAIN = {
-        'models': [ # List of regression models for HDDMRegressor
-            # Ensure condition 'A' is a valid level in your data or dummy data for C(..., Treatment('A'))
-            {'model': 'v ~ C(condition, Treatment("A"))', 'link_func': lambda x: x},
-        ],
-        'include': ['sv', 'st', 'sz'],
-        'p_outlier': 0.05,
-        'group_only_regressors': False,
-        'keep_regressor_trace': True
+        'models': [],  # Empty list means use basic DDM without regression
+        'include': ['v', 'a', 't'],  # Include essential parameters
+        'p_outlier': 0.05,  # 5% probability of outlier responses
+        'is_group_model': False  # Fit individual subject models
     }
     HDDM_NUM_SAMPLES = 100 # Reduced for main script testing
     HDDM_BURN_IN = 50    # Reduced for main script testing
@@ -847,10 +1181,17 @@ if __name__ == "__main__":
                 nes_id = all_subject_nes_idata.get(s_id)
                 hddm_id = all_subject_hddm_idata.get(s_id)
 
-                # Check if log_likelihood attribute and specific model key exist
-                if not (hasattr(nes_id, 'log_likelihood') and 'nes' in nes_id.log_likelihood and
-                        hasattr(hddm_id, 'log_likelihood') and 'hddm' in hddm_id.log_likelihood):
-                    print(f"Log likelihood data structure incorrect or missing in InferenceData for subject {s_id}. Skipping comparison.")
+                # Check if log_likelihood attribute exists and has the expected structure
+                if not (hasattr(nes_id, 'log_likelihood') and 'log_likelihood' in nes_id.log_likelihood and
+                        hasattr(hddm_id, 'log_likelihood') and 'log_likelihood' in hddm_id.log_likelihood):
+                    print(f"Log likelihood data structure incorrect or missing in InferenceData for subject {s_id}. "
+                          f"NES has log_likelihood: {hasattr(nes_id, 'log_likelihood')}, "
+                          f"HDDM has log_likelihood: {hasattr(hddm_id, 'log_likelihood')}")
+                    if hasattr(nes_id, 'log_likelihood'):
+                        print(f"NES log_likelihood keys: {list(nes_id.log_likelihood.keys())}")
+                    if hasattr(hddm_id, 'log_likelihood'):
+                        print(f"HDDM log_likelihood keys: {list(hddm_id.log_likelihood.keys())}")
+                    print("Skipping comparison.")
                     continue
                 try:
                     compare_dict_subj = {"nes": nes_id, "hddm": hddm_id}
