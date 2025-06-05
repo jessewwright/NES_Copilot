@@ -1,0 +1,4 @@
+agent,lambda,pct_B_chosen,mean_drift
+NES,0.0,1.0,0.8
+NES,0.5,0.0,-0.19999999999999996
+NES,1.0,0.0,-1.2

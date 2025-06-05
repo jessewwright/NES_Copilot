@@ -1,0 +1,8 @@
+agent_type: BOTH
+ws: 0.9       # Specific ws for NES
+wn: 1.1       # Specific wn for NES
+n_trials_per_lambda: 120 # Decent number for CIs and stable summary
+lambdas: [0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0] # Varied lambdas
+seed: 20231101
+reward_A: 0.2 # Skewed rewards
+reward_B: 1.2 # Skewed rewards, B is better
