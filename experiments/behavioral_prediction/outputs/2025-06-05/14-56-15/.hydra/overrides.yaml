@@ -1,0 +1,7 @@
+- common.model=DDMAgent
+- common.data_path=/tmp
+- common.output_path=/tmp
+- common.task=dummy
+- common.mode=test
+- common.num_subjects=1
+- common.loss_function=MSE
