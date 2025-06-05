@@ -10,3 +10,5 @@ sbi==0.22.0
 transformers>=4.18.0
 joblib>=1.1.0
 pebble>=4.6.0
+hddm>=0.9.7
+arviz>=0.15.0
