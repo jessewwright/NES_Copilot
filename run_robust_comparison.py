@@ -1,16 +1,25 @@
+import logging
 import os
 import sys
-import numpy as np
-import pandas as pd
-import arviz as az
-import xarray as xr
-import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 # Add the current directory to the path so we can import our debug module
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# and the src directory for nes_copilot package
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(current_dir)
+sys.path.append(os.path.join(current_dir, 'src'))
+
+import arviz as az
+import numpy as np
+import pandas as pd
+import torch
+import xarray as xr
+
 from debug_comparison import compare_models_robust
+from nes_copilot.agent_mvnes import MVNESAgent
+from nes_copilot.checkpoint_manager import CheckpointManager
+from nes_copilot.summary_stats_module import SummaryStatsModule
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +52,37 @@ HDDM_MODEL_CONFIG_MAIN = {
 HDDM_NUM_SAMPLES = NUM_SAMPLES + BURN_IN  # HDDM includes burn-in in total samples
 HDDM_BURN_IN = BURN_IN
 
+# Mock classes for SummaryStatsModule dependencies
+class MockConfigManager:
+    def __init__(self, logger_instance): # Renamed logger to logger_instance to avoid conflict
+        self.logger = logger_instance
+        self.config = { # Provide minimal config SummaryStatsModule might need
+            'summary_stats': {},
+            'master_config': {'device': 'cpu'}
+        }
+    def get_module_config(self, module_name: str) -> dict:
+        return self.config.get(module_name, {})
+    def get_param(self, param_name: str, default: Any = None) -> Any:
+        # Updated to access master_config correctly
+        return self.config.get('master_config', {}).get(param_name, default)
+
+class MockDataManager:
+    def __init__(self, logger_instance): # Renamed logger to logger_instance
+        self.logger = logger_instance
+    def get_output_path(self, module_name: str, filename: str) -> str:
+        # SummaryStatsModule might call this to save stats; make it benign
+        return os.path.join("mock_output", module_name, filename)
+    def save_json(self, data: dict, module_name: str, filename: str):
+        # Make this a no-op for now
+        self.logger.info(f"MockDataManager: save_json called for {module_name}/{filename}, doing nothing.")
+        pass
+
+class MockLoggingManager:
+    def __init__(self, logger_instance): # Renamed logger to logger_instance
+        self.logger = logger_instance
+    def get_logger(self, name: str): # Or however it provides the logger
+        return self.logger
+
 def load_empirical_data(filepath: str) -> Optional[pd.DataFrame]:
     """Load and prepare empirical data"""
     print(f"Loading empirical data from {filepath}")
@@ -54,80 +94,211 @@ def load_empirical_data(filepath: str) -> Optional[pd.DataFrame]:
         print(f"Error loading empirical data: {e}")
         return None
 
-def fit_nes_model(subject_data: pd.DataFrame, npe_checkpoint_path: str, 
-                  summary_stat_keys: List[str], nes_param_names: List[str], 
-                  fixed_nes_params: Dict[str, float], nes_ddm_params_config: Dict[str, float],
-                  num_samples: int = NES_NUM_SAMPLES, 
-                  num_chains: int = NES_NUM_CHAINS) -> Optional[az.InferenceData]:
-    """Fit NES model to subject data and return InferenceData"""
+def fit_nes_model(
+    subject_data: pd.DataFrame,
+    npe_checkpoint_path: str,
+    summary_stat_keys: List[str],
+    nes_param_names: List[str],
+    fixed_nes_params: Dict[str, float],
+    nes_ddm_params_config: Dict[str, float],
+    num_posterior_samples: int = NES_NUM_SAMPLES,  # Use existing global
+    num_chains: int = NES_NUM_CHAINS  # Use existing global
+) -> Optional[az.InferenceData]:
+
+    # --- 1. Load NPE Model ---
+    logger.info(f"Attempting to load NPE model from checkpoint: {npe_checkpoint_path}")
     try:
-        print("\n--- Fitting NES model for subject data ---")
-        print(f"Subject data shape: {subject_data.shape}")
-        print(f"NPE checkpoint: {npe_checkpoint_path}")
-        
-        # Mock NES fitting - replace with actual NES fitting code
-        n_trials = len(subject_data)
-        n_samples_chain = num_samples // num_chains
-        
-        # Create mock posterior samples with standardized dimensions
-        posterior_data = {}
-        for param in NES_DYNAMIC_PARAM_NAMES:
-            if param == 'v_norm':
-                posterior_data[param] = np.random.normal(0.5, 0.2, (num_chains, n_samples_chain, 1))  # Add trial dimension
-            elif param == 'a_0':
-                posterior_data[param] = np.random.normal(1.5, 0.3, (num_chains, n_samples_chain, 1))
-            elif param == 't_0':
-                posterior_data[param] = np.random.normal(0.3, 0.1, (num_chains, n_samples_chain, 1))
-            elif param == 'alpha_gain':
-                posterior_data[param] = np.random.normal(0.5, 0.2, (num_chains, n_samples_chain, 1))
-            elif param == 'beta_val':
-                posterior_data[param] = np.random.normal(1.0, 0.1, (num_chains, n_samples_chain, 1))
-        
-        # Add fixed parameters
-        for param, value in FIXED_NES_PARAMS.items():
-            posterior_data[param] = np.full((num_chains, n_samples_chain, 1), value)  # Add trial dimension
-        
-        # Create InferenceData with proper dimensions
-        idata = az.from_dict(
-            posterior=posterior_data,
-            coords={
-                'chain': np.arange(num_chains), 
-                'draw': np.arange(n_samples_chain),
-                'trial': np.arange(1)  # Single trial dimension for parameters
-            },
-            dims={param: ["trial"] for param in NES_DYNAMIC_PARAM_NAMES}
+        # Ensure the global logger is used if not passed explicitly
+        # CheckpointManager is expected to be initialized with a logger
+        checkpoint_manager = CheckpointManager(logger=logger)
+        checkpoint = checkpoint_manager.load_checkpoint(npe_checkpoint_path)
+
+        posterior_estimator = checkpoint['posterior']
+        # These are from the checkpoint file
+        loaded_param_names = checkpoint.get('param_names', [])
+        loaded_summary_stat_keys = checkpoint.get('summary_stat_keys', [])
+
+        # Compare with function arguments and log if different
+        # For now, we will proceed using the nes_param_names and summary_stat_keys passed to the function.
+        # A more robust strategy might be needed later (e.g., prioritize checkpoint's values).
+        if set(loaded_param_names) != set(nes_param_names):
+            logger.warning(f"Parameter names from checkpoint ({loaded_param_names}) "
+                           f"differ from input nes_param_names ({nes_param_names}). "
+                           f"Using input nes_param_names as primary for now.")
+
+        if set(loaded_summary_stat_keys) != set(summary_stat_keys):
+            logger.warning(f"Summary stat keys from checkpoint ({loaded_summary_stat_keys}) "
+                           f"differ from input summary_stat_keys ({summary_stat_keys}). "
+                           f"Using input summary_stat_keys as primary for now.")
+
+        logger.info(f"Successfully loaded NPE model. Posterior estimator type: {type(posterior_estimator)}")
+
+    except FileNotFoundError:
+        logger.error(f"NPE checkpoint file not found at: {npe_checkpoint_path}")
+        return None
+    except Exception as e:
+        logger.error(f"An unexpected error occurred while loading the NPE checkpoint: {e}", exc_info=True)
+        return None
+
+    # --- 2. Calculate Observed Summary Statistics ---
+    logger.info("Calculating observed summary statistics for NES model...")
+    x_observed_nes = None # Initialize to ensure it's defined
+    try:
+        # Initialize mock managers if SummaryStatsModule requires them
+        # Ensure these mock classes are defined globally or imported
+        mock_config_manager = MockConfigManager(logger_instance=logger) # Pass logger as logger_instance
+        mock_data_manager = MockDataManager(logger_instance=logger) # Pass logger as logger_instance
+        # Assuming SummaryStatsModule can take a logger directly via a mock LoggingManager
+        mock_logging_manager = MockLoggingManager(logger_instance=logger)
+
+        summary_stats_module = SummaryStatsModule(
+            config_manager=mock_config_manager,
+            data_manager=mock_data_manager,
+            logging_manager=mock_logging_manager
         )
         
-        # Add log-likelihood group with proper 3D shape (chains × draws × trials)
-        n_trials_ll = max(n_trials, 10)  # Ensure at least 10 trials
+        # Calculate summary statistics using the keys provided to the function
+        if not summary_stat_keys:
+            logger.warning("summary_stat_keys is empty. SummaryStatsModule might use defaults or fail.")
+            # Consider raising an error if summary_stat_keys are mandatory for this context
+            # For now, proceeding and letting SummaryStatsModule handle it or error out.
         
-        # Generate mock log-likelihood with correct shape (num_chains, n_samples_chain, n_trials_ll)
-        log_lik = np.random.normal(-1, 0.5, (num_chains, n_samples_chain, n_trials_ll))
+        summary_stats_results = summary_stats_module.run(
+            trials_df=subject_data,
+            stat_keys=summary_stat_keys
+        )
+        calculated_summary_stats_dict = summary_stats_results['summary_stats']
+
+        # Convert summary stats dictionary to a torch tensor in the correct order
+        x_observed_values = [calculated_summary_stats_dict.get(key, np.nan) for key in summary_stat_keys]
+
+        if np.isnan(x_observed_values).any():
+            logger.error(f"NaNs found in observed summary statistics: {x_observed_values} for keys {summary_stat_keys} from dict {calculated_summary_stats_dict}")
+            raise ValueError("NaNs found in calculated summary statistics for NES.")
+
+        x_observed_nes = torch.tensor(x_observed_values, dtype=torch.float32).reshape(1, -1)
         
-        # Create coords for the log-likelihood dataset
-        coords = {
-            'chain': np.arange(num_chains),
-            'draw': np.arange(n_samples_chain),
-            'trial': np.arange(n_trials_ll)
+        logger.info(f"Successfully calculated and formatted observed summary statistics for NES. Shape: {x_observed_nes.shape}")
+
+    except Exception as e:
+        logger.error(f"An error occurred during summary statistics calculation for NES: {e}", exc_info=True)
+        return None
+
+    # --- 3. Draw Posterior Samples ---
+    logger.info(f"Drawing {num_posterior_samples} posterior samples for NES model across {num_chains} chains...")
+
+    if num_chains <= 0:
+        logger.error("Number of chains must be positive.")
+        return None
+        
+    num_samples_per_chain = num_posterior_samples // num_chains
+    if num_samples_per_chain == 0:
+        logger.warning(
+            f"num_posterior_samples ({num_posterior_samples}) is less than num_chains ({num_chains}). "
+            f"Resulting in num_samples_per_chain = {num_samples_per_chain}. "
+            "Consider increasing num_posterior_samples or decreasing num_chains."
+        )
+        if num_posterior_samples > 0 and num_samples_per_chain == 0:
+             logger.info(f"Setting num_samples_per_chain to 1 as num_posterior_samples ({num_posterior_samples}) > 0.")
+             num_samples_per_chain = 1 # Ensure at least one sample if total is > 0
+        elif num_posterior_samples == 0 :
+             logger.error("num_posterior_samples is 0. Cannot draw samples.")
+             return None
+
+    posterior_samples_dict = {} # Initialize before try block
+    try:
+        # Initialize with empty lists for each parameter name
+        posterior_samples_dict = {param_name: [] for param_name in nes_param_names}
+
+        for i in range(num_chains):
+            logger.info(f"Sampling chain {i+1}/{num_chains} ({num_samples_per_chain} samples)...")
+            samples_for_current_chain = posterior_estimator.sample(
+                (num_samples_per_chain,),
+                x=x_observed_nes,
+                show_progress_bars=False
+            ).numpy()  # Convert to NumPy array, shape (num_samples_per_chain, num_parameters)
+
+            for j, param_name in enumerate(nes_param_names):
+                posterior_samples_dict[param_name].append(samples_for_current_chain[:, j])
+        
+        for param_name in nes_param_names:
+            posterior_samples_dict[param_name] = np.array(posterior_samples_dict[param_name])
+            # Expected shape for each param: (num_chains, num_samples_per_chain)
+
+        logger.info("Successfully drew posterior samples for all dynamic NES parameters.")
+        # Example: logger.info(f"Shape for param '{nes_param_names[0]}': {posterior_samples_dict[nes_param_names[0]].shape}")
+
+    except Exception as e:
+        logger.error(f"An error occurred during posterior sampling for NES: {e}", exc_info=True)
+        return None
+
+    # --- This is where the old mock posterior_data dictionary was built ---
+    # --- Now, `posterior_samples_dict` holds the actual samples for dynamic params ---
+
+    # --- 4. Construct ArviZ InferenceData object ---
+    logger.info("Constructing ArviZ InferenceData object...")
+    try:
+        # Determine chain and draw counts from actual samples
+        if not nes_param_names or not posterior_samples_dict or nes_param_names[0] not in posterior_samples_dict:
+            logger.error("Cannot determine sampling dimensions, nes_param_names or posterior_samples_dict is invalid.")
+            return None
+
+        # Check if the first parameter's samples are available and get shape
+        first_param_samples = posterior_samples_dict[nes_param_names[0]]
+        if not hasattr(first_param_samples, 'shape') or len(first_param_samples.shape) < 2:
+            logger.error(f"Samples for parameter '{nes_param_names[0]}' are not in the expected format (e.g., not a NumPy array or insufficient dimensions). Shape is: {getattr(first_param_samples, 'shape', 'N/A')}")
+            return None
+        _num_chains, _num_samples_per_chain = first_param_samples.shape
+
+        posterior_data_for_arviz = posterior_samples_dict.copy() # Start with dynamic params
+
+        # Expand fixed parameters to match sample dimensions
+        for param_key, param_value in fixed_nes_params.items():
+            posterior_data_for_arviz[param_key] = np.full((_num_chains, _num_samples_per_chain), param_value)
+
+        coords_for_arviz = {
+            'chain': np.arange(_num_chains),
+            'draw': np.arange(_num_samples_per_chain)
         }
         
-        # Create log-likelihood dataset
-        log_lik_ds = xr.Dataset(
-            data_vars={
-                'nes': (['chain', 'draw', 'trial'], log_lik)
-            },
-            coords=coords
+        # Prepare observed data
+        observed_data_for_arviz = {
+            'rt': subject_data['rt'].values,
+            'response': subject_data['response'].values
+        }
+        if 'frame' in subject_data.columns: # Check if column exists
+            observed_data_for_arviz['frame'] = subject_data['frame'].values
+        if 'valence_score' in subject_data.columns: # Check if column exists
+            observed_data_for_arviz['valence_score'] = subject_data['valence_score'].values
+
+        # Create InferenceData object
+        idata = az.from_dict(
+            posterior=posterior_data_for_arviz,
+            observed_data=observed_data_for_arviz,
+            coords=coords_for_arviz
         )
+
+        # Add MOCK log_likelihood data
+        _num_trials = len(subject_data)
+        _n_trials_ll_mock = max(_num_trials, 10)
+
+        mock_log_lik_values = np.random.normal(-1, 0.5, (_num_chains, _num_samples_per_chain, _n_trials_ll_mock))
+        mock_log_lik_coords = {
+            'chain': np.arange(_num_chains),
+            'draw': np.arange(_num_samples_per_chain),
+            'trial_ll': np.arange(_n_trials_ll_mock)
+        }
+        log_lik_ds_mock = xr.Dataset(
+            data_vars={'nes': (['chain', 'draw', 'trial_ll'], mock_log_lik_values)}, # Model name 'nes'
+            coords=mock_log_lik_coords
+        )
+        idata.add_groups({'log_likelihood': log_lik_ds_mock})
         
-        # Add log-likelihood group to InferenceData
-        idata.add_groups({
-            'log_likelihood': log_lik_ds
-        })
-        
-        print(f"NES fitting completed for subject {subject_data['subj_idx'].iloc[0]} with {n_samples_chain} samples per chain")
+        logger.info("Successfully constructed InferenceData with actual posterior samples and MOCK log-likelihoods.")
         return idata
+
     except Exception as e:
-        logger.error(f"Error in NES model fitting: {e}", exc_info=True)
+        logger.error(f"Error constructing InferenceData object: {e}", exc_info=True)
         return None
 
 def fit_hddm_ext_model(subject_data_orig: pd.DataFrame, hddm_model_config: Dict[str, Any],
@@ -313,7 +484,7 @@ def main():
             nes_param_names=NES_DYNAMIC_PARAM_NAMES,
             fixed_nes_params=FIXED_NES_PARAMS,
             nes_ddm_params_config=NES_DDM_BASE_CONFIG,
-            num_samples=NES_NUM_SAMPLES,
+            num_posterior_samples=NES_NUM_SAMPLES,
             num_chains=NES_NUM_CHAINS
         )
         
