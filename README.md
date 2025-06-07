@@ -153,6 +153,13 @@ The Posterior Predictive Checks module validates fitted models by comparing simu
 
 The analysis module provides tools for analyzing and visualizing results.
 
+### Model Comparison
+
+The `model_comparison_pipeline` module offers utilities to compare the NES model
+against a standard HDDM using WAIC and LOO.  A helper script `simple_model_comparison.py`
+demonstrates how to fit both models for a subject, generate pointwise
+log‑likelihoods, and produce comparison tables using ArviZ.
+
 ## Testing
 
 To run the tests:
